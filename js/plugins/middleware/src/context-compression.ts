@@ -29,7 +29,6 @@ interface CompressionExecutionState {
 }
 
 const compressionStorage = new AsyncLocalStorage<CompressionExecutionState>();
-const TRUNCATION_MARKER = '[TRUNCATED:';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -97,13 +96,18 @@ export const ContextCompressionOptionsSchema = z.object({
   ),
 
   /**
-   * Hard cap on message count. Messages beyond this (oldest first) are
-   * dropped, preserving system messages and recent messages.
+   * Maximum message count target. Messages beyond this (oldest first) are
+   * dropped while preserving system messages. Any leading tool or model messages
+   * at the truncation cutoff are also discarded to satisfy LLM API requirements
+   * (ensuring history begins with a user turn and avoiding orphaned tool responses).
+   * The final message count will be at most `maxMessages`.
    */
   maxMessages: z
     .number()
     .optional()
-    .describe('Hard cap on message count. Drop oldest beyond this.'),
+    .describe(
+      'Maximum message count target. Drops older non-system messages, ensuring history begins with a user turn.'
+    ),
 
   /**
    * Insert a notice message when messages are dropped during message
@@ -162,8 +166,27 @@ function stringifyOutput(output: unknown): string {
   }
 }
 
-function isAlreadyTruncated(output: unknown): boolean {
-  return typeof output === 'string' && output.includes(TRUNCATION_MARKER);
+function hasCompressionFlag(
+  msg: MessageData,
+  flag: 'truncated' | 'capped' | 'notice'
+): boolean {
+  const ccMeta = msg.metadata?.contextCompression as
+    | Record<string, unknown>
+    | undefined;
+  return Boolean(ccMeta?.[flag]);
+}
+
+function withCompressionMetadata(
+  target: { metadata?: Record<string, unknown> },
+  fields: Record<string, unknown>
+): Record<string, unknown> {
+  return {
+    ...target.metadata,
+    contextCompression: {
+      ...((target.metadata?.contextCompression as Record<string, unknown>) ?? {}),
+      ...fields,
+    },
+  };
 }
 
 /**
@@ -271,12 +294,17 @@ export const contextCompression: GenerateMiddleware<
       const result = messages.map((msg, mIdx) => {
         if (msg.role !== 'tool') return msg;
 
+        // Skip if already compressed to the lowest limit (toolResponses.maxChars)
+        if (hasCompressionFlag(msg, 'truncated')) {
+          return msg;
+        }
+
+        let msgTruncated = false;
+        let msgCapped = false;
         let changed = false;
+
         const newContent = msg.content.map((part, pIdx): Part => {
-          if (
-            !part.toolResponse ||
-            isAlreadyTruncated(part.toolResponse.output)
-          ) {
+          if (!part.toolResponse) {
             return part;
           }
 
@@ -287,14 +315,23 @@ export const contextCompression: GenerateMiddleware<
               : maxToolResponseChars;
 
           if (limit === Infinity) return part;
+          // Skip if already capped by safety ceiling and still within the safety-cap zone
+          if (limit === maxToolResponseChars && hasCompressionFlag(msg, 'capped')) {
+            return part;
+          }
 
           const outputStr = stringifyOutput(part.toolResponse.output);
           if (outputStr.length <= limit) return part;
 
           changed = true;
-          if (isTruncatable && toolMaxChars && limit === toolMaxChars) {
+
+          // If truncatable and clamped to toolMaxChars, it's context-compression truncation.
+          // Otherwise, it was clamped by maxToolResponseChars (the hard safety cap).
+          if (isTruncatable && limit === toolMaxChars) {
             truncated++;
+            msgTruncated = true;
             return {
+              ...part,
               toolResponse: {
                 ...part.toolResponse,
                 output:
@@ -306,7 +343,9 @@ export const contextCompression: GenerateMiddleware<
             };
           } else {
             capped++;
+            msgCapped = true;
             return {
+              ...part,
               toolResponse: {
                 ...part.toolResponse,
                 output:
@@ -318,7 +357,16 @@ export const contextCompression: GenerateMiddleware<
           }
         });
 
-        return changed ? { ...msg, content: newContent } : msg;
+        if (!changed) return msg;
+
+        return {
+          ...msg,
+          metadata: withCompressionMetadata(msg, {
+            ...(msgTruncated ? { truncated: true } : {}),
+            ...(msgCapped ? { capped: true } : {}),
+          }),
+          content: newContent,
+        };
       });
 
       return { messages: result, capped, truncated };
@@ -361,20 +409,26 @@ export const contextCompression: GenerateMiddleware<
       if (dropped > 0 && insertTruncationNotice) {
         noticeInserted = true;
         if (systemMessages.length > 0) {
-          const alreadyHasNotice = systemMessages[0].content.some((p) =>
-            p.text?.includes(truncationNoticeText)
+          const alreadyHasNotice = systemMessages.some((m) =>
+            hasCompressionFlag(m, 'notice')
           );
-          const updatedSystem: MessageData = alreadyHasNotice
-            ? systemMessages[0]
-            : {
-                ...systemMessages[0],
-                content: [
-                  ...systemMessages[0].content,
-                  { text: `\n\n${truncationNoticeText}` },
-                ],
-              };
+          const lastIdx = systemMessages.length - 1;
+          const updatedSystemMessages = alreadyHasNotice
+            ? systemMessages
+            : systemMessages.map((msg, idx) =>
+                idx === lastIdx
+                  ? {
+                      ...msg,
+                      metadata: withCompressionMetadata(msg, { notice: true }),
+                      content: [
+                        ...msg.content,
+                        { text: `\n\n${truncationNoticeText}` },
+                      ],
+                    }
+                  : msg
+              );
           return {
-            messages: [updatedSystem, ...systemMessages.slice(1), ...kept],
+            messages: [...updatedSystemMessages, ...kept],
             dropped,
             noticeInserted,
             tailCount: kept.length,
@@ -382,6 +436,7 @@ export const contextCompression: GenerateMiddleware<
         } else {
           const notice: MessageData = {
             role: 'system',
+            metadata: withCompressionMetadata({}, { notice: true }),
             content: [{ text: truncationNoticeText }],
           };
           return {

@@ -594,6 +594,7 @@ describe('contextCompression middleware', () => {
         },
         {
           role: 'tool',
+          metadata: { contextCompression: { truncated: true } },
           content: [
             {
               toolResponse: {
@@ -656,6 +657,10 @@ describe('contextCompression middleware', () => {
     assert.strictEqual(msgs.length, 4);
     assert.strictEqual(msgs[0].role, 'system');
     assert.match(msgs[0].content[1].text!, /\[NOTE\] Some earlier messages/);
+    assert.strictEqual(
+      (msgs[0].metadata?.contextCompression as any)?.notice,
+      true
+    );
     assert.strictEqual(msgs[1].role, 'user');
     assert.strictEqual(msgs[1].content[0].text, 'user 2');
     assert.strictEqual(msgs[2].role, 'model');
@@ -682,7 +687,11 @@ describe('contextCompression middleware', () => {
       messages: [
         {
           role: 'system',
-          content: [{ text: 'System prompt' }, { text: `\n\n${noticeText}` }],
+          metadata: { contextCompression: { notice: true } },
+          content: [
+            { text: 'System prompt' },
+            { text: `\n\n${noticeText}` },
+          ],
         },
         { role: 'user', content: [{ text: 'user 1' }] },
         { role: 'model', content: [{ text: 'model 1' }] },
@@ -700,5 +709,258 @@ describe('contextCompression middleware', () => {
     const msgs = capturedRequest!.messages;
     assert.strictEqual(msgs[0].role, 'system');
     assert.strictEqual(msgs[0].content.length, 2);
+  });
+
+  it('appends truncation notice to the last system message when multiple exist', async () => {
+    const ai = genkit({});
+    let capturedRequest: GenerateRequest | undefined;
+
+    const pm = ai.defineModel({ name: 'multiSysModel' }, async (req) => {
+      capturedRequest = req;
+      return {
+        message: { role: 'model', content: [{ text: 'done' }] },
+        usage: { inputTokens: 50 },
+      };
+    });
+
+    await ai.generate({
+      model: pm,
+      messages: [
+        { role: 'system', content: [{ text: 'System 1' }] },
+        { role: 'system', content: [{ text: 'System 2' }] },
+        { role: 'user', content: [{ text: 'user 1' }] },
+        { role: 'model', content: [{ text: 'model 1' }] },
+        { role: 'user', content: [{ text: 'user 2' }] },
+      ],
+      use: [
+        contextCompression({
+          maxMessages: 3,
+          insertTruncationNotice: true,
+        }),
+      ],
+    });
+
+    const msgs = capturedRequest!.messages;
+    assert.strictEqual(msgs.length, 3);
+    assert.strictEqual(msgs[0].role, 'system');
+    assert.strictEqual(msgs[0].content[0].text, 'System 1');
+    assert.strictEqual(msgs[1].role, 'system');
+    assert.strictEqual(msgs[1].content[0].text, 'System 2');
+    assert.match(msgs[1].content[1].text!, /\[NOTE\] Some earlier messages/);
+    assert.strictEqual(
+      (msgs[1].metadata?.contextCompression as any)?.notice,
+      true
+    );
+    assert.strictEqual(msgs[2].role, 'user');
+    assert.strictEqual(msgs[2].content[0].text, 'user 2');
+  });
+
+  it('stamps message metadata and respects metadata flags across message and parts', async () => {
+    const ai = genkit({});
+    let capturedRequest: GenerateRequest | undefined;
+
+    const pm = ai.defineModel({ name: 'metaFlagModel' }, async (req) => {
+      capturedRequest = req;
+      return {
+        message: { role: 'model', content: [{ text: 'done' }] },
+        usage: { inputTokens: 50 },
+      };
+    });
+
+    // First generate: verify that truncation stamps message metadata
+    await ai.generate({
+      model: pm,
+      messages: [
+        { role: 'user', content: [{ text: 'query' }] },
+        {
+          role: 'model',
+          content: [{ toolRequest: { name: 'toolA', input: {} } }],
+        },
+        {
+          role: 'tool',
+          content: [
+            {
+              toolResponse: {
+                name: 'toolA',
+                output: 'A'.repeat(500),
+              },
+            },
+          ],
+        },
+        { role: 'user', content: [{ text: 'next' }] },
+      ],
+      use: [
+        contextCompression({
+          maxInputTokens: 10,
+          toolResponses: { maxChars: 50, preserveRecent: 0 },
+        }),
+      ],
+    });
+
+    const toolMsg = capturedRequest!.messages.find((m) => m.role === 'tool');
+    assert.strictEqual(
+      (toolMsg!.metadata?.contextCompression as any)?.truncated,
+      true
+    );
+
+    // Second generate: pass a part that only has the metadata flag and no string notice
+    let secondCaptured: GenerateRequest | undefined;
+    const pm2 = ai.defineModel({ name: 'metaCheckModel' }, async (req) => {
+      secondCaptured = req;
+      return {
+        message: { role: 'model', content: [{ text: 'ok' }] },
+        usage: { inputTokens: 500 },
+      };
+    });
+
+    const cleanOutput = 'Custom already-truncated text without marker';
+    await ai.generate({
+      model: pm2,
+      messages: [
+        { role: 'user', content: [{ text: 'query' }] },
+        {
+          role: 'model',
+          content: [{ toolRequest: { name: 'toolA', input: {} } }],
+        },
+        {
+          role: 'tool',
+          metadata: { contextCompression: { truncated: true } },
+          content: [
+            {
+              toolResponse: {
+                name: 'toolA',
+                output: cleanOutput,
+              },
+            },
+          ],
+        },
+        { role: 'user', content: [{ text: 'next' }] },
+      ],
+      use: [
+        contextCompression({
+          maxInputTokens: 10,
+          toolResponses: { maxChars: 10, preserveRecent: 0 },
+        }),
+      ],
+    });
+
+    const secondToolMsg = secondCaptured!.messages.find((m) => m.role === 'tool');
+    assert.strictEqual(
+      secondToolMsg!.content[0].toolResponse?.output,
+      cleanOutput
+    );
+  });
+
+  it('stamps capped in metadata for safety cap and allows subsequent truncation', async () => {
+    const ai = genkit({});
+    let capturedRequest: GenerateRequest | undefined;
+
+    const pm = ai.defineModel({ name: 'capMetaModel' }, async (req) => {
+      capturedRequest = req;
+      return {
+        message: { role: 'model', content: [{ text: 'ok' }] },
+        usage: { inputTokens: 50 },
+      };
+    });
+
+    // 1. Tool response is preserved from toolMaxChars, but exceeds maxToolResponseChars (safety cap)
+    await ai.generate({
+      model: pm,
+      messages: [
+        { role: 'user', content: [{ text: 'q' }] },
+        {
+          role: 'model',
+          content: [{ toolRequest: { name: 'toolA', input: {} } }],
+        },
+        {
+          role: 'tool',
+          content: [
+            {
+              toolResponse: {
+                name: 'toolA',
+                output: 'X'.repeat(500),
+              },
+            },
+          ],
+        },
+        { role: 'user', content: [{ text: 'q2' }] },
+      ],
+      use: [
+        contextCompression({
+          maxInputTokens: 10,
+          maxToolResponseChars: 200,
+          toolResponses: { maxChars: 50, preserveRecent: 1 },
+        }),
+      ],
+    });
+
+    const toolMsg1 = capturedRequest!.messages.find((m) => m.role === 'tool');
+    assert.strictEqual(
+      (toolMsg1!.metadata?.contextCompression as any)?.capped,
+      true
+    );
+    assert.strictEqual(
+      (toolMsg1!.metadata?.contextCompression as any)?.truncated,
+      undefined
+    );
+
+    // 2. In next turn, toolA is no longer the most recent tool response, so it becomes truncatable
+    let capturedRequest2: GenerateRequest | undefined;
+    const pm2 = ai.defineModel({ name: 'capMetaModel2' }, async (req) => {
+      capturedRequest2 = req;
+      return {
+        message: { role: 'model', content: [{ text: 'ok' }] },
+        usage: { inputTokens: 50 },
+      };
+    });
+
+    await ai.generate({
+      model: pm2,
+      messages: [
+        { role: 'user', content: [{ text: 'q' }] },
+        {
+          role: 'model',
+          content: [{ toolRequest: { name: 'toolA', input: {} } }],
+        },
+        toolMsg1!,
+        { role: 'user', content: [{ text: 'q2' }] },
+        {
+          role: 'model',
+          content: [{ toolRequest: { name: 'toolB', input: {} } }],
+        },
+        {
+          role: 'tool',
+          content: [
+            {
+              toolResponse: {
+                name: 'toolB',
+                output: 'recent tool output',
+              },
+            },
+          ],
+        },
+        { role: 'user', content: [{ text: 'q3' }] },
+      ],
+      use: [
+        contextCompression({
+          maxInputTokens: 10,
+          maxToolResponseChars: 200,
+          toolResponses: { maxChars: 50, preserveRecent: 1 },
+        }),
+      ],
+    });
+
+    const toolMsgA = capturedRequest2!.messages[2];
+    assert.strictEqual(
+      (toolMsgA.metadata?.contextCompression as any)?.truncated,
+      true
+    );
+    assert.strictEqual(
+      (toolMsgA.metadata?.contextCompression as any)?.capped,
+      true
+    );
+    assert.ok(
+      (toolMsgA.content[0].toolResponse?.output as string).startsWith('X'.repeat(50))
+    );
   });
 });

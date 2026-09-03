@@ -253,7 +253,7 @@ Compresses conversation context when it grows too large, reducing token usage an
 
 1. **Safety cap**: Hard-truncates any single oversized tool response (`maxToolResponseChars`, default: 400,000 chars).
 2. **Tool response truncation**: Truncates tool responses exceeding a character limit (`toolResponses`), preserving the most recent responses.
-3. **Message count cap**: Drops older non-system messages when exceeding `maxMessages`, optionally inserting a notice.
+3. **Message count cap**: Drops older non-system messages when exceeding `maxMessages`, preserving system messages and ensuring conversation history begins with a user turn.
 
 ```typescript
 import { genkit } from 'genkit';
@@ -285,7 +285,7 @@ const response = await ai.generate({
 | `toolResponses` | `object` | — | Truncation settings for older tool responses. |
 | `toolResponses.maxChars` | `number` | — | Max characters per older tool response. |
 | `toolResponses.preserveRecent` | `number` | `2` | Number of most recent tool responses to keep untruncated. |
-| `maxMessages` | `number` | — | Hard cap on message count. Drops oldest non-system messages. |
+| `maxMessages` | `number` | — | Maximum message count target. Drops older non-system messages, ensuring history begins with a user turn. |
 | `insertTruncationNotice` | `boolean` | `true` | Inserts an advisory notice when messages are dropped. |
 | `truncationNotice` | `string` | standard text | Custom notice text to use when messages are dropped. |
 
