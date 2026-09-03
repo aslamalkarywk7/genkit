@@ -17,6 +17,7 @@
 import {
   ActionRunOptions,
   GenkitError,
+  getErrorMessage,
   stripUndefinedProps,
   z,
 } from '@genkit-ai/core';
@@ -68,10 +69,54 @@ export function assertValidToolNames(tools: ToolAction[]) {
   }
 }
 
-function toRunOptions(part: ToolRequestPart): ToolRunOptions {
+/** Options the loop passes to a tool: the request's metadata and the call's abort signal. */
+export interface ToolResolveOptions {
+  /** The generate call's abort signal, handed to every tool it runs. */
+  abortSignal?: AbortSignal;
+}
+
+function toRunOptions(
+  part: ToolRequestPart,
+  options?: ToolResolveOptions
+): ToolRunOptions {
   const out: ToolRunOptions = { metadata: part.metadata };
   if (part.metadata?.resumed) out.resumed = part.metadata.resumed;
+  if (options?.abortSignal) out.abortSignal = options.abortSignal;
   return out;
+}
+
+/**
+ * Classifies a tool's error for the loop. A tool that failed on its own terms
+ * is an INTERNAL failure of the generation, since a tool's failure is not a
+ * failure of the caller's request, and the tool's own error is the `cause`. A
+ * tool that stopped because the call's abort signal fired is not a tool
+ * failure at all: that error carries CANCELLED, so the partial response
+ * reports `aborted` rather than blaming the tool for a stop the caller asked
+ * for. The check keys on the call's signal, so a tool that throws an abort
+ * error on its own terms is still a tool failure.
+ *
+ * The tool's own text stays in-process unless it is already a GenkitError: an
+ * HTTP handler sends a GenkitError's message to the client, and a tool's
+ * arbitrary exception is not written for one.
+ */
+function toolFailureError(
+  name: string,
+  cause: unknown,
+  abortSignal?: AbortSignal
+): GenkitError {
+  const stopped = !!abortSignal?.aborted;
+  const verb = stopped ? 'stopped' : 'failed';
+  const isGenkit = cause instanceof GenkitError;
+  const text = isGenkit ? cause.originalMessage : getErrorMessage(cause);
+  return new GenkitError({
+    status: stopped ? 'CANCELLED' : 'INTERNAL',
+    message: `tool "${name}" ${verb}: ${text}`,
+    detail: isGenkit ? cause.detail : undefined,
+    cause,
+    publicMessage: isGenkit
+      ? cause.publicMessage && `tool "${name}" ${verb}: ${cause.publicMessage}`
+      : `tool "${name}" ${verb}`,
+  });
 }
 
 /**
@@ -186,7 +231,7 @@ export async function resolveToolRequest(
         },
       };
     }
-    throw e;
+    throw toolFailureError(part.toolRequest.name, e, initialCtx.abortSignal);
   }
 }
 
@@ -198,7 +243,8 @@ export async function resolveToolRequests(
   rawRequest: GenerateActionOptions,
   generatedMessage: MessageData,
   tools: ToolAction[],
-  middleware: GenerateMiddlewareDef[] = []
+  middleware: GenerateMiddlewareDef[] = [],
+  options?: ToolResolveOptions
 ): Promise<{
   revisedModelMessage?: MessageData;
   toolMessage?: MessageData;
@@ -224,7 +270,8 @@ export async function resolveToolRequests(
         rawRequest,
         part as ToolRequestPart,
         toolMap,
-        middleware
+        middleware,
+        toRunOptions(part as ToolRequestPart, options)
       );
 
       if (response) {
@@ -289,7 +336,8 @@ async function resolveResumedToolRequest(
   rawRequest: GenerateActionOptions,
   part: ToolRequestPart,
   toolMap: Record<string, ToolAction>,
-  middleware: GenerateMiddlewareDef[] = []
+  middleware: GenerateMiddlewareDef[] = [],
+  options?: ToolResolveOptions
 ): Promise<{
   toolRequest?: ToolRequestPart;
   toolResponse?: ToolResponsePart;
@@ -356,7 +404,8 @@ async function resolveResumedToolRequest(
       rawRequest,
       restartRequest,
       toolMap,
-      middleware
+      middleware,
+      toRunOptions(restartRequest, options)
     );
 
     // if there's a new interrupt, return it
@@ -388,7 +437,8 @@ export async function resolveResumeOption(
   registry: Registry,
   rawRequest: GenerateActionOptions,
   tools: ToolAction[],
-  middleware: GenerateMiddlewareDef[] = []
+  middleware: GenerateMiddlewareDef[] = [],
+  options?: ToolResolveOptions
 ): Promise<{
   revisedRequest?: GenerateActionOptions;
   interruptedResponse?: GenerateResponseData;
@@ -424,7 +474,8 @@ export async function resolveResumeOption(
         rawRequest,
         part,
         toolMap,
-        middleware
+        middleware,
+        options
       );
       if (resolved.interrupt) {
         interrupted = true;
@@ -495,7 +546,8 @@ export async function resolveResumeOption(
 export async function resolveRestartedTools(
   registry: Registry,
   rawRequest: GenerateActionOptions,
-  middleware: GenerateMiddlewareDef[] = []
+  middleware: GenerateMiddlewareDef[] = [],
+  options?: ToolResolveOptions
 ): Promise<ToolRequestPart[]> {
   const tools = await resolveTools(registry, rawRequest.tools);
   // rawRequest.tools only holds user-provided tools (treated as immutable). We must
@@ -516,7 +568,8 @@ export async function resolveRestartedTools(
         rawRequest,
         p,
         toolMap,
-        middleware
+        middleware,
+        toRunOptions(p, options)
       );
 
       // this means that it interrupted *again* after the restart

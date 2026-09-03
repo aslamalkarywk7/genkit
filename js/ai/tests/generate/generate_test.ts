@@ -15,6 +15,7 @@
  */
 
 import {
+  GenkitError,
   defineDynamicActionProvider,
   z,
   type PluginProvider,
@@ -24,6 +25,9 @@ import { Registry } from '@genkit-ai/core/registry';
 import * as assert from 'assert';
 import { beforeEach, describe, it } from 'node:test';
 import {
+  GenerateResponse,
+  GenerationAbortedError,
+  GenerationResponseError,
   generate,
   generateStream,
   normalizeMiddleware,
@@ -34,12 +38,13 @@ import {
 import { generateMiddleware } from '../../src/generate/middleware.js';
 import {
   defineModel,
+  type GenerateResponseData,
   type ModelAction,
   type ModelMiddleware,
   type ModelMiddlewareWithOptions,
 } from '../../src/model.js';
 import { defineResource } from '../../src/resource.js';
-import { defineTool, tool } from '../../src/tool.js';
+import { ToolInterruptError, defineTool, tool } from '../../src/tool.js';
 
 initNodeFeatures();
 
@@ -1027,6 +1032,614 @@ describe('generate', () => {
 
     const context = JSON.parse(response.text.substring('Context: '.length));
     assert.deepStrictEqual(context.val, ['A', 'B']);
+  });
+});
+
+describe('generate failures', () => {
+  let registry: Registry;
+  let modelCalls: number;
+
+  beforeEach(() => {
+    registry = new Registry();
+    modelCalls = 0;
+  });
+
+  /**
+   * Defines a model that asks for `toolName` on its first call and then runs
+   * `then` on every later call, which either returns the final reply or
+   * throws. Model responses carry a usage count so a partial's accounting can
+   * be checked.
+   */
+  function defineToolLoopModel(
+    toolName: string,
+    then: (call: number) => GenerateResponseData
+  ): ModelAction {
+    return defineModel(
+      registry,
+      { name: 'loopModel', supports: { tools: true } },
+      async () => {
+        modelCalls++;
+        if (modelCalls === 1) {
+          return {
+            message: {
+              role: 'model',
+              content: [{ toolRequest: { name: toolName, input: {}, ref: 'r1' } }],
+            },
+            finishReason: 'stop',
+            usage: { inputTokens: modelCalls },
+          };
+        }
+        return then(modelCalls);
+      }
+    );
+  }
+
+  function defineOkTool(name = 'okTool') {
+    return defineTool(
+      registry,
+      { name, description: 'ok' },
+      async () => 'ok'
+    );
+  }
+
+  const roles = (r: GenerateResponse) => r.messages.map((m) => m.role);
+
+  it('returns the completed rounds when a later model call fails', async () => {
+    defineOkTool();
+    defineToolLoopModel('okTool', () => {
+      throw new GenkitError({
+        status: 'UNAVAILABLE',
+        message: 'model melted',
+        detail: { provider: 'x' },
+        responseMetadata: { retryAfterMs: 1000 },
+      });
+    });
+
+    await assert.rejects(
+      generate(registry, { model: 'loopModel', prompt: 'go', tools: ['okTool'] }),
+      (e: any) => {
+        assert.ok(e instanceof GenerationResponseError);
+        assert.ok(!(e instanceof GenerationAbortedError));
+        // The wrap is lossless: status, text, detail, retry metadata, cause.
+        assert.strictEqual(e.status, 'UNAVAILABLE');
+        assert.strictEqual(e.originalMessage, 'model melted');
+        assert.strictEqual(e.detail.provider, 'x');
+        assert.strictEqual(e.responseMetadata?.retryAfterMs, 1000);
+        assert.ok(e.cause instanceof GenkitError);
+        assert.strictEqual(e.cause.originalMessage, 'model melted');
+
+        const partial: GenerateResponse = e.detail.response;
+        assert.strictEqual(partial.finishReason, 'failed');
+        assert.strictEqual(partial.finishMessage, 'model melted');
+        assert.deepStrictEqual(partial.error, {
+          status: 'UNAVAILABLE',
+          message: 'model melted',
+          details: { provider: 'x' },
+        });
+        assert.strictEqual(partial.message, undefined);
+        // The seam: the caller's message and the completed tool round, nothing
+        // from the failed call. A model call that failed has no accounting.
+        assert.deepStrictEqual(roles(partial), ['user', 'model', 'tool']);
+        assert.deepStrictEqual(
+          partial.messages[2].content[0].toolResponse?.output,
+          'ok'
+        );
+        assert.deepStrictEqual(partial.usage, {});
+        return true;
+      }
+    );
+    assert.strictEqual(modelCalls, 2);
+  });
+
+  it('drops the round a failed tool opened and reports the tool failure as INTERNAL', async () => {
+    defineTool(registry, { name: 'badTool', description: 'bad' }, async () => {
+      throw new Error('db password rejected');
+    });
+    defineToolLoopModel('badTool', () => ({
+      message: { role: 'model', content: [{ text: 'unreachable' }] },
+      finishReason: 'stop',
+    }));
+
+    await assert.rejects(
+      generate(registry, { model: 'loopModel', prompt: 'go', tools: ['badTool'] }),
+      (e: any) => {
+        assert.ok(e instanceof GenerationResponseError);
+        assert.strictEqual(e.status, 'INTERNAL');
+        assert.strictEqual(
+          e.originalMessage,
+          'tool "badTool" failed: db password rejected'
+        );
+        // errors.Is/As in Go; the cause chain in JS reaches the tool's own error.
+        assert.ok(e.cause instanceof GenkitError);
+        assert.strictEqual((e.cause.cause as Error).message, 'db password rejected');
+
+        const partial: GenerateResponse = e.detail.response;
+        assert.strictEqual(partial.finishReason, 'failed');
+        assert.strictEqual(partial.error?.status, 'INTERNAL');
+        // The whole round goes, the model message that opened it included.
+        assert.deepStrictEqual(roles(partial), ['user']);
+        // The failing turn's accounting stays.
+        assert.deepStrictEqual(partial.usage, { inputTokens: 1 });
+
+        // A tool's arbitrary exception text is not written for a client; the
+        // wire form carries the classification and the finish reason only.
+        assert.deepStrictEqual(e.toJSON(), {
+          status: 'INTERNAL',
+          message: 'tool "badTool" failed',
+          details: {
+            finishReason: 'failed',
+            finishMessage: 'tool "badTool" failed: db password rejected',
+          },
+        });
+        return true;
+      }
+    );
+    assert.strictEqual(modelCalls, 1);
+  });
+
+  it('keeps a tool GenkitError text on the wire and its status on the cause', async () => {
+    defineTool(registry, { name: 'flaky', description: 'flaky' }, async () => {
+      throw new GenkitError({ status: 'UNAVAILABLE', message: 'flaky tool failed' });
+    });
+    defineToolLoopModel('flaky', () => ({
+      message: { role: 'model', content: [{ text: 'unreachable' }] },
+      finishReason: 'stop',
+    }));
+
+    await assert.rejects(
+      generate(registry, { model: 'loopModel', prompt: 'go', tools: ['flaky'] }),
+      (e: any) => {
+        assert.strictEqual(e.status, 'INTERNAL');
+        assert.strictEqual(e.cause.cause.status, 'UNAVAILABLE');
+        assert.strictEqual(e.toJSON().message, 'tool "flaky" failed: flaky tool failed');
+        return true;
+      }
+    );
+  });
+
+  it('reports a failed tool as soon as it fails while its siblings finish detached', async () => {
+    let siblingDone = false;
+    defineTool(registry, { name: 'fast', description: 'fast' }, async () => {
+      throw new Error('fast failed');
+    });
+    defineTool(registry, { name: 'slow', description: 'slow' }, async () => {
+      await new Promise((r) => setTimeout(r, 30));
+      siblingDone = true;
+      return 'slow done';
+    });
+    defineModel(
+      registry,
+      { name: 'twoTools', supports: { tools: true } },
+      async () => ({
+        message: {
+          role: 'model',
+          content: [
+            { toolRequest: { name: 'fast', input: {}, ref: 'a' } },
+            { toolRequest: { name: 'slow', input: {}, ref: 'b' } },
+          ],
+        },
+        finishReason: 'stop',
+      })
+    );
+
+    await assert.rejects(
+      generate(registry, { model: 'twoTools', prompt: 'go', tools: ['fast', 'slow'] }),
+      (e: any) => {
+        assert.strictEqual(e.originalMessage, 'tool "fast" failed: fast failed');
+        assert.strictEqual(siblingDone, false);
+        return true;
+      }
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    assert.strictEqual(siblingDone, true);
+  });
+
+  it('stops at the turn limit with the round it refused to run dropped', async () => {
+    defineOkTool();
+    defineModel(
+      registry,
+      { name: 'alwaysTool', supports: { tools: true } },
+      async () => {
+        modelCalls++;
+        return {
+          message: {
+            role: 'model',
+            content: [
+              { toolRequest: { name: 'okTool', input: {}, ref: `r${modelCalls}` } },
+            ],
+          },
+          finishReason: 'stop',
+          usage: { inputTokens: modelCalls },
+        };
+      }
+    );
+
+    await assert.rejects(
+      generate(registry, {
+        model: 'alwaysTool',
+        prompt: 'go',
+        tools: ['okTool'],
+        maxTurns: 1,
+      }),
+      (e: any) => {
+        assert.ok(e instanceof GenerationAbortedError);
+        assert.strictEqual(e.status, 'ABORTED');
+        assert.strictEqual(
+          e.originalMessage,
+          'Exceeded maximum tool call iterations (1)'
+        );
+        const partial: GenerateResponse = e.detail.response;
+        assert.strictEqual(partial.finishReason, 'aborted');
+        assert.strictEqual(partial.error?.status, 'ABORTED');
+        assert.strictEqual(partial.message, undefined);
+        // The first round completed; the second was refused and goes whole.
+        assert.deepStrictEqual(roles(partial), ['user', 'model', 'tool']);
+        assert.deepStrictEqual(partial.usage, { inputTokens: 2 });
+        // The wire form carries no request.
+        assert.strictEqual(e.toJSON().details.response, undefined);
+        assert.strictEqual(JSON.stringify(e).includes('"messages"'), false);
+        return true;
+      }
+    );
+    assert.strictEqual(modelCalls, 2);
+  });
+
+  it('reports a signal that was already aborted before calling the model', async () => {
+    defineToolLoopModel('okTool', () => ({
+      message: { role: 'model', content: [{ text: 'unreachable' }] },
+      finishReason: 'stop',
+    }));
+    const controller = new AbortController();
+    controller.abort();
+
+    await assert.rejects(
+      generate(registry, {
+        model: 'loopModel',
+        prompt: 'go',
+        abortSignal: controller.signal,
+      }),
+      (e: any) => {
+        assert.ok(e instanceof GenerationAbortedError);
+        assert.strictEqual(e.status, 'CANCELLED');
+        const partial: GenerateResponse = e.detail.response;
+        assert.strictEqual(partial.finishReason, 'aborted');
+        assert.strictEqual(partial.error?.status, 'CANCELLED');
+        assert.deepStrictEqual(roles(partial), ['user']);
+        return true;
+      }
+    );
+    assert.strictEqual(modelCalls, 0);
+  });
+
+  it('keeps a completed round when the caller aborts between turns', async () => {
+    const controller = new AbortController();
+    defineTool(registry, { name: 'stopper', description: 'stops' }, async () => {
+      controller.abort();
+      return 'done';
+    });
+    defineToolLoopModel('stopper', () => ({
+      message: { role: 'model', content: [{ text: 'unreachable' }] },
+      finishReason: 'stop',
+    }));
+
+    await assert.rejects(
+      generate(registry, {
+        model: 'loopModel',
+        prompt: 'go',
+        tools: ['stopper'],
+        abortSignal: controller.signal,
+      }),
+      (e: any) => {
+        assert.ok(e instanceof GenerationAbortedError);
+        assert.strictEqual(e.status, 'CANCELLED');
+        const partial: GenerateResponse = e.detail.response;
+        assert.strictEqual(partial.finishReason, 'aborted');
+        // The tool answered before the stop, so its round is a seam.
+        assert.deepStrictEqual(roles(partial), ['user', 'model', 'tool']);
+        return true;
+      }
+    );
+    assert.strictEqual(modelCalls, 1);
+  });
+
+  it('classifies a tool that failed after the caller aborted as a stop, not a tool failure', async () => {
+    const controller = new AbortController();
+    defineTool(
+      registry,
+      { name: 'stopper', description: 'stops' },
+      async (_, { abortSignal }) => {
+        controller.abort();
+        assert.strictEqual(abortSignal?.aborted, true); // the signal reaches the tool
+        throw new Error('gave up');
+      }
+    );
+    defineToolLoopModel('stopper', () => ({
+      message: { role: 'model', content: [{ text: 'unreachable' }] },
+      finishReason: 'stop',
+    }));
+
+    await assert.rejects(
+      generate(registry, {
+        model: 'loopModel',
+        prompt: 'go',
+        tools: ['stopper'],
+        abortSignal: controller.signal,
+      }),
+      (e: any) => {
+        assert.ok(e instanceof GenerationAbortedError);
+        assert.strictEqual(e.status, 'CANCELLED');
+        assert.strictEqual(e.originalMessage, 'tool "stopper" stopped: gave up');
+        const partial: GenerateResponse = e.detail.response;
+        assert.strictEqual(partial.finishReason, 'aborted');
+        assert.deepStrictEqual(roles(partial), ['user']);
+        return true;
+      }
+    );
+  });
+
+  it('reports a timed-out model call as aborted with DEADLINE_EXCEEDED', async () => {
+    defineModel(registry, { name: 'slow' }, async () => {
+      throw new DOMException('timed out', 'TimeoutError');
+    });
+
+    await assert.rejects(
+      generate(registry, { model: 'slow', prompt: 'go' }),
+      (e: any) => {
+        assert.ok(e instanceof GenerationAbortedError);
+        assert.strictEqual(e.status, 'DEADLINE_EXCEEDED');
+        assert.strictEqual(e.detail.response.finishReason, 'aborted');
+        return true;
+      }
+    );
+  });
+
+  it('treats a provider answering ABORTED as a failure, not a caller stop', async () => {
+    defineModel(registry, { name: 'conflict' }, async () => {
+      throw new GenkitError({ status: 'ABORTED', message: 'conflict' });
+    });
+
+    await assert.rejects(
+      generate(registry, { model: 'conflict', prompt: 'go' }),
+      (e: any) => {
+        assert.ok(e instanceof GenerationResponseError);
+        assert.ok(!(e instanceof GenerationAbortedError));
+        assert.strictEqual(e.status, 'ABORTED');
+        assert.strictEqual(e.detail.response.finishReason, 'failed');
+        return true;
+      }
+    );
+  });
+
+  it('keeps the model message when structured output fails validation', async () => {
+    defineModel(registry, { name: 'badJson' }, async () => ({
+      message: { role: 'model', content: [{ text: '{"a": "not a number"}' }] },
+      finishReason: 'stop',
+    }));
+
+    await assert.rejects(
+      generate(registry, {
+        model: 'badJson',
+        prompt: 'go',
+        output: { schema: z.object({ a: z.number() }) },
+      }),
+      (e: any) => {
+        assert.ok(e instanceof GenerationResponseError);
+        assert.strictEqual(e.status, 'INVALID_ARGUMENT');
+        assert.ok(e.cause instanceof GenkitError);
+        const partial: GenerateResponse = e.detail.response;
+        // Not a loop stop: the model's own message and finish reason stay.
+        assert.strictEqual(partial.finishReason, 'stop');
+        assert.strictEqual(partial.text, '{"a": "not a number"}');
+        assert.strictEqual(partial.error?.status, 'INVALID_ARGUMENT');
+        assert.deepStrictEqual(roles(partial), ['user', 'model']);
+        return true;
+      }
+    );
+  });
+
+  it('keeps an interrupted response when a restarted tool interrupts again', async () => {
+    defineTool(
+      registry,
+      { name: 'confirm', description: 'confirm' },
+      async () => {
+        throw new ToolInterruptError({ again: true });
+      }
+    );
+    defineToolLoopModel('confirm', () => ({
+      message: { role: 'model', content: [{ text: 'unreachable' }] },
+      finishReason: 'stop',
+    }));
+
+    await assert.rejects(
+      generate(registry, {
+        model: 'loopModel',
+        tools: ['confirm'],
+        messages: [
+          { role: 'user', content: [{ text: 'hi' }] },
+          {
+            role: 'model',
+            content: [
+              {
+                toolRequest: { name: 'confirm', input: {}, ref: 'c1' },
+                metadata: { interrupt: true },
+              },
+            ],
+          },
+        ],
+        resume: {
+          restart: [{ toolRequest: { name: 'confirm', input: {}, ref: 'c1' } }],
+        },
+      }),
+      (e: any) => {
+        assert.ok(e instanceof GenerationResponseError);
+        assert.strictEqual(e.status, 'FAILED_PRECONDITION');
+        const partial: GenerateResponse = e.detail.response;
+        assert.strictEqual(partial.finishReason, 'interrupted');
+        assert.strictEqual(partial.error?.status, 'FAILED_PRECONDITION');
+        // The revised model message is the tip, answered with `resume`.
+        assert.deepStrictEqual(roles(partial), ['user', 'model']);
+        assert.deepStrictEqual(partial.interrupts[0].metadata?.interrupt, {
+          again: true,
+        });
+        assert.ok(e.detail.message);
+        return true;
+      }
+    );
+    assert.strictEqual(modelCalls, 0);
+  });
+
+  it('carries a partial for a resume the loop rejected', async () => {
+    defineToolLoopModel('okTool', () => ({
+      message: { role: 'model', content: [{ text: 'unreachable' }] },
+      finishReason: 'stop',
+    }));
+
+    await assert.rejects(
+      generate(registry, {
+        model: 'loopModel',
+        messages: [
+          { role: 'user', content: [{ text: 'hi' }] },
+          {
+            role: 'model',
+            content: [{ toolRequest: { name: 'other', input: {}, ref: 'o1' } }],
+          },
+        ],
+        resume: {
+          respond: [{ toolResponse: { name: 'nope', ref: 'x', output: 1 } }],
+        },
+      }),
+      (e: any) => {
+        assert.ok(e instanceof GenerationResponseError);
+        assert.strictEqual(e.status, 'INVALID_ARGUMENT');
+        assert.strictEqual(e.detail.response.finishReason, 'failed');
+        assert.deepStrictEqual(roles(e.detail.response), ['user', 'model']);
+        return true;
+      }
+    );
+  });
+
+  it('carries no partial for an error raised before the request resolved', async () => {
+    defineModel(registry, { name: 'echo' }, async (input) => ({
+      message: input.messages[0],
+      finishReason: 'stop',
+    }));
+
+    await assert.rejects(
+      generate(registry, {
+        model: 'echo',
+        prompt: [{ resource: { uri: 'test://missing' } }],
+      }),
+      (e: any) => {
+        assert.strictEqual(e.status, 'NOT_FOUND');
+        assert.strictEqual(e.detail?.response, undefined);
+        return true;
+      }
+    );
+  });
+
+  it('restores the loop partial when a generate hook drops it', async () => {
+    defineOkTool();
+    defineToolLoopModel('okTool', () => {
+      throw new GenkitError({ status: 'UNAVAILABLE', message: 'model melted' });
+    });
+    const dropping = generateMiddleware({ name: 'dropping' }, () => ({
+      generate: async (envelope, ctx, next) => {
+        try {
+          return await next(envelope, ctx);
+        } catch (e) {
+          throw new Error('hook replaced');
+        }
+      },
+    }));
+
+    await assert.rejects(
+      generate(registry, {
+        model: 'loopModel',
+        prompt: 'go',
+        tools: ['okTool'],
+        use: [dropping()],
+      }),
+      (e: any) => {
+        assert.ok(e instanceof GenerationResponseError);
+        // The hook's error is what the caller gets...
+        assert.strictEqual(e.status, 'INTERNAL');
+        assert.strictEqual(e.originalMessage, 'hook replaced');
+        assert.strictEqual((e.cause as Error).message, 'hook replaced');
+        // ...with the conversation the loop had completed, and the failure the
+        // loop itself recorded, restored beside it.
+        const partial: GenerateResponse = e.detail.response;
+        assert.deepStrictEqual(roles(partial), ['user', 'model', 'tool']);
+        assert.strictEqual(partial.error?.message, 'model melted');
+        return true;
+      }
+    );
+  });
+
+  it('does not pair a recovered failure with a later hook error', async () => {
+    defineModel(registry, { name: 'flakyModel' }, async () => {
+      modelCalls++;
+      if (modelCalls === 1) {
+        throw new GenkitError({ status: 'UNAVAILABLE', message: 'model melted' });
+      }
+      return {
+        message: { role: 'model', content: [{ text: 'recovered' }] },
+        finishReason: 'stop',
+      };
+    });
+    const retrying = generateMiddleware({ name: 'retrying' }, () => ({
+      generate: async (envelope, ctx, next) => {
+        try {
+          await next(envelope, ctx);
+        } catch (e) {
+          // The retry succeeds; the hook then fails on its own terms.
+          await next(envelope, ctx);
+        }
+        throw new Error('hook gave up');
+      },
+    }));
+
+    await assert.rejects(
+      generate(registry, { model: 'flakyModel', prompt: 'go', use: [retrying()] }),
+      (e: any) => {
+        assert.ok(e instanceof GenerationResponseError);
+        const partial: GenerateResponse = e.detail.response;
+        // Synthesized from the turn's request, not the stale first failure.
+        assert.strictEqual(partial.error?.message, 'hook gave up');
+        assert.strictEqual(partial.finishReason, 'failed');
+        assert.deepStrictEqual(roles(partial), ['user']);
+        return true;
+      }
+    );
+    assert.strictEqual(modelCalls, 2);
+  });
+
+  it('rejects the streamed response with the same partial', async () => {
+    defineOkTool();
+    defineToolLoopModel('okTool', () => {
+      throw new GenkitError({ status: 'UNAVAILABLE', message: 'model melted' });
+    });
+
+    const { stream, response } = generateStream(registry, {
+      model: 'loopModel',
+      prompt: 'go',
+      tools: ['okTool'],
+    });
+    const chunks: string[] = [];
+    await assert.rejects(
+      (async () => {
+        for await (const chunk of stream) {
+          chunks.push(chunk.role ?? 'model');
+        }
+      })(),
+      (e: any) => e instanceof GenerationResponseError
+    );
+    await assert.rejects(response, (e: any) => {
+      assert.ok(e instanceof GenerationResponseError);
+      assert.deepStrictEqual(roles(e.detail.response), ['user', 'model', 'tool']);
+      return true;
+    });
+    // The completed round's tool message was streamed before the failure.
+    assert.deepStrictEqual(chunks, ['tool']);
   });
 });
 
