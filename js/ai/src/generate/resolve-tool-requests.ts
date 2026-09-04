@@ -111,12 +111,28 @@ function toolFailureError(
   return new GenkitError({
     status: stopped ? 'CANCELLED' : 'INTERNAL',
     message: `tool "${name}" ${verb}: ${text}`,
-    detail: isGenkit ? cause.detail : undefined,
+    detail: errorDetailsOf(cause),
     cause,
     publicMessage: isGenkit
       ? cause.publicMessage && `tool "${name}" ${verb}: ${cause.publicMessage}`
       : `tool "${name}" ${verb}`,
   });
+}
+
+/**
+ * The structured details a cause contributes to the error that wraps it: a
+ * GenkitError's own `detail`, without the request or response payloads a
+ * generation error carries, which would otherwise repeat a conversation (or
+ * nest one per agent depth) inside the wrapper's details.
+ */
+export function errorDetailsOf(cause: unknown): unknown {
+  if (!(cause instanceof GenkitError)) return undefined;
+  const detail = cause.detail;
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) {
+    return detail;
+  }
+  const { request: _request, response: _response, ...rest } = detail;
+  return Object.keys(rest).length > 0 ? rest : undefined;
 }
 
 /**
@@ -155,10 +171,12 @@ export async function resolveToolRequest(
 }> {
   const tool = toolMap[part.toolRequest.name];
   if (!tool) {
+    // No request on the detail: the partial response the loop attaches
+    // carries the conversation, and a detail here would repeat it on the
+    // wire.
     throw new GenkitError({
       status: 'NOT_FOUND',
       message: `Tool ${part.toolRequest.name} not found`,
-      detail: { request: rawRequest },
     });
   }
 

@@ -22,6 +22,7 @@ import {
 } from '@genkit-ai/core';
 import { initNodeFeatures } from '@genkit-ai/core/node';
 import { Registry } from '@genkit-ai/core/registry';
+import { ValidationError } from '@genkit-ai/core/schema';
 import * as assert from 'assert';
 import { beforeEach, describe, it } from 'node:test';
 import {
@@ -1063,7 +1064,9 @@ describe('generate failures', () => {
           return {
             message: {
               role: 'model',
-              content: [{ toolRequest: { name: toolName, input: {}, ref: 'r1' } }],
+              content: [
+                { toolRequest: { name: toolName, input: {}, ref: 'r1' } },
+              ],
             },
             finishReason: 'stop',
             usage: { inputTokens: modelCalls },
@@ -1075,11 +1078,7 @@ describe('generate failures', () => {
   }
 
   function defineOkTool(name = 'okTool') {
-    return defineTool(
-      registry,
-      { name, description: 'ok' },
-      async () => 'ok'
-    );
+    return defineTool(registry, { name, description: 'ok' }, async () => 'ok');
   }
 
   const roles = (r: GenerateResponse) => r.messages.map((m) => m.role);
@@ -1096,7 +1095,11 @@ describe('generate failures', () => {
     });
 
     await assert.rejects(
-      generate(registry, { model: 'loopModel', prompt: 'go', tools: ['okTool'] }),
+      generate(registry, {
+        model: 'loopModel',
+        prompt: 'go',
+        tools: ['okTool'],
+      }),
       (e: any) => {
         assert.ok(e instanceof GenerationResponseError);
         assert.ok(!(e instanceof GenerationAbortedError));
@@ -1141,7 +1144,11 @@ describe('generate failures', () => {
     }));
 
     await assert.rejects(
-      generate(registry, { model: 'loopModel', prompt: 'go', tools: ['badTool'] }),
+      generate(registry, {
+        model: 'loopModel',
+        prompt: 'go',
+        tools: ['badTool'],
+      }),
       (e: any) => {
         assert.ok(e instanceof GenerationResponseError);
         assert.strictEqual(e.status, 'INTERNAL');
@@ -1151,7 +1158,10 @@ describe('generate failures', () => {
         );
         // errors.Is/As in Go; the cause chain in JS reaches the tool's own error.
         assert.ok(e.cause instanceof GenkitError);
-        assert.strictEqual((e.cause.cause as Error).message, 'db password rejected');
+        assert.strictEqual(
+          (e.cause.cause as Error).message,
+          'db password rejected'
+        );
 
         const partial: GenerateResponse = e.detail.response;
         assert.strictEqual(partial.finishReason, 'failed');
@@ -1168,9 +1178,13 @@ describe('generate failures', () => {
           message: 'tool "badTool" failed',
           details: {
             finishReason: 'failed',
-            finishMessage: 'tool "badTool" failed: db password rejected',
+            finishMessage: 'tool "badTool" failed',
           },
         });
+        assert.strictEqual(
+          JSON.stringify(e).includes('db password rejected'),
+          false
+        );
         return true;
       }
     );
@@ -1179,7 +1193,10 @@ describe('generate failures', () => {
 
   it('keeps a tool GenkitError text on the wire and its status on the cause', async () => {
     defineTool(registry, { name: 'flaky', description: 'flaky' }, async () => {
-      throw new GenkitError({ status: 'UNAVAILABLE', message: 'flaky tool failed' });
+      throw new GenkitError({
+        status: 'UNAVAILABLE',
+        message: 'flaky tool failed',
+      });
     });
     defineToolLoopModel('flaky', () => ({
       message: { role: 'model', content: [{ text: 'unreachable' }] },
@@ -1187,11 +1204,18 @@ describe('generate failures', () => {
     }));
 
     await assert.rejects(
-      generate(registry, { model: 'loopModel', prompt: 'go', tools: ['flaky'] }),
+      generate(registry, {
+        model: 'loopModel',
+        prompt: 'go',
+        tools: ['flaky'],
+      }),
       (e: any) => {
         assert.strictEqual(e.status, 'INTERNAL');
         assert.strictEqual(e.cause.cause.status, 'UNAVAILABLE');
-        assert.strictEqual(e.toJSON().message, 'tool "flaky" failed: flaky tool failed');
+        assert.strictEqual(
+          e.toJSON().message,
+          'tool "flaky" failed: flaky tool failed'
+        );
         return true;
       }
     );
@@ -1223,9 +1247,16 @@ describe('generate failures', () => {
     );
 
     await assert.rejects(
-      generate(registry, { model: 'twoTools', prompt: 'go', tools: ['fast', 'slow'] }),
+      generate(registry, {
+        model: 'twoTools',
+        prompt: 'go',
+        tools: ['fast', 'slow'],
+      }),
       (e: any) => {
-        assert.strictEqual(e.originalMessage, 'tool "fast" failed: fast failed');
+        assert.strictEqual(
+          e.originalMessage,
+          'tool "fast" failed: fast failed'
+        );
         assert.strictEqual(siblingDone, false);
         return true;
       }
@@ -1245,7 +1276,13 @@ describe('generate failures', () => {
           message: {
             role: 'model',
             content: [
-              { toolRequest: { name: 'okTool', input: {}, ref: `r${modelCalls}` } },
+              {
+                toolRequest: {
+                  name: 'okTool',
+                  input: {},
+                  ref: `r${modelCalls}`,
+                },
+              },
             ],
           },
           finishReason: 'stop',
@@ -1268,15 +1305,30 @@ describe('generate failures', () => {
           e.originalMessage,
           'Exceeded maximum tool call iterations (1)'
         );
+        assert.ok(e.cause instanceof GenkitError);
         const partial: GenerateResponse = e.detail.response;
         assert.strictEqual(partial.finishReason, 'aborted');
-        assert.strictEqual(partial.error?.status, 'ABORTED');
+        assert.deepStrictEqual(partial.error, {
+          status: 'ABORTED',
+          message: 'Exceeded maximum tool call iterations (1)',
+        });
+        assert.strictEqual(
+          partial.finishMessage,
+          'Exceeded maximum tool call iterations (1)'
+        );
         assert.strictEqual(partial.message, undefined);
         // The first round completed; the second was refused and goes whole.
         assert.deepStrictEqual(roles(partial), ['user', 'model', 'tool']);
         assert.deepStrictEqual(partial.usage, { inputTokens: 2 });
         // The wire form carries no request.
-        assert.strictEqual(e.toJSON().details.response, undefined);
+        assert.deepStrictEqual(e.toJSON(), {
+          status: 'ABORTED',
+          message: 'Exceeded maximum tool call iterations (1)',
+          details: {
+            finishReason: 'aborted',
+            finishMessage: 'Exceeded maximum tool call iterations (1)',
+          },
+        });
         assert.strictEqual(JSON.stringify(e).includes('"messages"'), false);
         return true;
       }
@@ -1313,10 +1365,14 @@ describe('generate failures', () => {
 
   it('keeps a completed round when the caller aborts between turns', async () => {
     const controller = new AbortController();
-    defineTool(registry, { name: 'stopper', description: 'stops' }, async () => {
-      controller.abort();
-      return 'done';
-    });
+    defineTool(
+      registry,
+      { name: 'stopper', description: 'stops' },
+      async () => {
+        controller.abort();
+        return 'done';
+      }
+    );
     defineToolLoopModel('stopper', () => ({
       message: { role: 'model', content: [{ text: 'unreachable' }] },
       finishReason: 'stop',
@@ -1368,7 +1424,10 @@ describe('generate failures', () => {
       (e: any) => {
         assert.ok(e instanceof GenerationAbortedError);
         assert.strictEqual(e.status, 'CANCELLED');
-        assert.strictEqual(e.originalMessage, 'tool "stopper" stopped: gave up');
+        assert.strictEqual(
+          e.originalMessage,
+          'tool "stopper" stopped: gave up'
+        );
         const partial: GenerateResponse = e.detail.response;
         assert.strictEqual(partial.finishReason, 'aborted');
         assert.deepStrictEqual(roles(partial), ['user']);
@@ -1425,7 +1484,7 @@ describe('generate failures', () => {
       (e: any) => {
         assert.ok(e instanceof GenerationResponseError);
         assert.strictEqual(e.status, 'INVALID_ARGUMENT');
-        assert.ok(e.cause instanceof GenkitError);
+        assert.ok(e.cause instanceof ValidationError);
         const partial: GenerateResponse = e.detail.response;
         // Not a loop stop: the model's own message and finish reason stay.
         assert.strictEqual(partial.finishReason, 'stop');
@@ -1579,7 +1638,10 @@ describe('generate failures', () => {
     defineModel(registry, { name: 'flakyModel' }, async () => {
       modelCalls++;
       if (modelCalls === 1) {
-        throw new GenkitError({ status: 'UNAVAILABLE', message: 'model melted' });
+        throw new GenkitError({
+          status: 'UNAVAILABLE',
+          message: 'model melted',
+        });
       }
       return {
         message: { role: 'model', content: [{ text: 'recovered' }] },
@@ -1599,7 +1661,11 @@ describe('generate failures', () => {
     }));
 
     await assert.rejects(
-      generate(registry, { model: 'flakyModel', prompt: 'go', use: [retrying()] }),
+      generate(registry, {
+        model: 'flakyModel',
+        prompt: 'go',
+        use: [retrying()],
+      }),
       (e: any) => {
         assert.ok(e instanceof GenerationResponseError);
         const partial: GenerateResponse = e.detail.response;
@@ -1635,11 +1701,209 @@ describe('generate failures', () => {
     );
     await assert.rejects(response, (e: any) => {
       assert.ok(e instanceof GenerationResponseError);
-      assert.deepStrictEqual(roles(e.detail.response), ['user', 'model', 'tool']);
+      assert.deepStrictEqual(roles(e.detail.response), [
+        'user',
+        'model',
+        'tool',
+      ]);
       return true;
     });
     // The completed round's tool message was streamed before the failure.
     assert.deepStrictEqual(chunks, ['tool']);
+  });
+
+  it('drops streamed text with the failed model call while the chunks reached onChunk', async () => {
+    defineModel(
+      registry,
+      { name: 'streamThenDie', apiVersion: 'v2' },
+      async (_, { sendChunk }) => {
+        sendChunk({ content: [{ text: 'a' }] });
+        sendChunk({ content: [{ text: 'b' }] });
+        throw new GenkitError({
+          status: 'UNAVAILABLE',
+          message: 'model melted',
+        });
+      }
+    );
+    const streamed: string[] = [];
+
+    await assert.rejects(
+      generate(registry, {
+        model: 'streamThenDie',
+        prompt: 'go',
+        onChunk: (c) => streamed.push(c.text),
+      }),
+      (e: any) => {
+        const partial: GenerateResponse = e.detail.response;
+        assert.strictEqual(partial.message, undefined);
+        assert.deepStrictEqual(roles(partial), ['user']);
+        return true;
+      }
+    );
+    assert.deepStrictEqual(streamed, ['a', 'b']);
+  });
+
+  it('keeps the completed round when a hook fails before running a later turn', async () => {
+    defineOkTool();
+    defineToolLoopModel('okTool', () => ({
+      message: { role: 'model', content: [{ text: 'unreachable' }] },
+      finishReason: 'stop',
+    }));
+    const budget = generateMiddleware({ name: 'budget' }, () => ({
+      generate: async (envelope, ctx, next) => {
+        if (envelope.currentTurn === 1) throw new Error('budget exceeded');
+        return next(envelope, ctx);
+      },
+    }));
+
+    await assert.rejects(
+      generate(registry, {
+        model: 'loopModel',
+        prompt: 'go',
+        tools: ['okTool'],
+        use: [budget()],
+      }),
+      (e: any) => {
+        assert.ok(e instanceof GenerationResponseError);
+        assert.ok(!(e instanceof GenerationAbortedError));
+        assert.strictEqual(e.status, 'INTERNAL');
+        assert.strictEqual(e.originalMessage, 'budget exceeded');
+        const partial: GenerateResponse = e.detail.response;
+        // The conversation entering the refused turn is the seam.
+        assert.deepStrictEqual(roles(partial), ['user', 'model', 'tool']);
+        assert.strictEqual(partial.finishReason, 'failed');
+        assert.strictEqual(partial.error?.message, 'budget exceeded');
+        return true;
+      }
+    );
+    assert.strictEqual(modelCalls, 1);
+  });
+
+  it('carries no partial when a hook fails before running the first turn', async () => {
+    defineToolLoopModel('okTool', () => ({
+      message: { role: 'model', content: [{ text: 'unreachable' }] },
+      finishReason: 'stop',
+    }));
+    const deny = generateMiddleware({ name: 'deny' }, () => ({
+      generate: async () => {
+        throw new Error('denied');
+      },
+    }));
+
+    // The request has not resolved when the first turn's hooks run, so the
+    // error is the hook's own (a divergence from Go, which resolves first).
+    await assert.rejects(
+      generate(registry, { model: 'loopModel', prompt: 'go', use: [deny()] }),
+      (e: any) => {
+        assert.strictEqual(e.message, 'denied');
+        assert.strictEqual(e.detail?.response, undefined);
+        return true;
+      }
+    );
+    assert.strictEqual(modelCalls, 0);
+  });
+
+  it('drops a sibling interrupt with the round its failed sibling opened', async () => {
+    defineTool(registry, { name: 'ask', description: 'asks' }, async () => {
+      throw new ToolInterruptError({ question: 'why?' });
+    });
+    defineTool(registry, { name: 'badTool', description: 'bad' }, async () => {
+      throw new Error('db exploded');
+    });
+    defineModel(
+      registry,
+      { name: 'askAndFail', supports: { tools: true } },
+      async () => ({
+        message: {
+          role: 'model',
+          content: [
+            { toolRequest: { name: 'ask', input: {}, ref: 'a' } },
+            { toolRequest: { name: 'badTool', input: {}, ref: 'b' } },
+          ],
+        },
+        finishReason: 'stop',
+      })
+    );
+
+    await assert.rejects(
+      generate(registry, {
+        model: 'askAndFail',
+        prompt: 'go',
+        tools: ['ask', 'badTool'],
+      }),
+      (e: any) => {
+        assert.strictEqual(e.status, 'INTERNAL');
+        assert.ok(e.originalMessage.startsWith('tool "badTool" failed'));
+        const partial: GenerateResponse = e.detail.response;
+        assert.deepStrictEqual(roles(partial), ['user']);
+        assert.deepStrictEqual(partial.interrupts, []);
+        return true;
+      }
+    );
+  });
+
+  it('keeps a model plain error text off the wire', async () => {
+    defineModel(registry, { name: 'sdkModel' }, async () => {
+      throw new Error('sdk secret');
+    });
+
+    await assert.rejects(
+      generate(registry, { model: 'sdkModel', prompt: 'go' }),
+      (e: any) => {
+        assert.strictEqual(e.status, 'INTERNAL');
+        assert.strictEqual(e.originalMessage, 'sdk secret');
+        assert.deepStrictEqual(e.toJSON(), {
+          status: 'INTERNAL',
+          message: 'generation failed',
+          details: {
+            finishReason: 'failed',
+            finishMessage: 'generation failed',
+          },
+        });
+        assert.strictEqual(JSON.stringify(e).includes('sdk secret'), false);
+        return true;
+      }
+    );
+  });
+
+  it('keeps a nested generate failure from repeating the inner conversation', async () => {
+    defineModel(registry, { name: 'innerModel' }, async () => {
+      throw new GenkitError({ status: 'UNAVAILABLE', message: 'inner melted' });
+    });
+    defineTool(
+      registry,
+      { name: 'nested', description: 'calls generate' },
+      async () => {
+        await generate(registry, {
+          model: 'innerModel',
+          prompt: 'inner secret',
+        });
+        return 'unreachable';
+      }
+    );
+    defineToolLoopModel('nested', () => ({
+      message: { role: 'model', content: [{ text: 'unreachable' }] },
+      finishReason: 'stop',
+    }));
+
+    await assert.rejects(
+      generate(registry, {
+        model: 'loopModel',
+        prompt: 'outer',
+        tools: ['nested'],
+      }),
+      (e: any) => {
+        assert.strictEqual(e.status, 'INTERNAL');
+        const partial: GenerateResponse = e.detail.response;
+        // The inner loop's partial rides on the cause chain, not on the data.
+        assert.ok(e.cause.cause instanceof GenerationResponseError);
+        assert.strictEqual(partial.error?.details, undefined);
+        const serialized = JSON.stringify(partial.toJSON());
+        assert.strictEqual(serialized.includes('inner secret'), false);
+        assert.strictEqual(JSON.stringify(e).includes('inner secret'), false);
+        return true;
+      }
+    );
   });
 });
 

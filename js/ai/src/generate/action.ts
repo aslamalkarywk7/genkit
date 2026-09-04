@@ -43,6 +43,7 @@ import {
   normalizeMiddleware,
 } from '../generate.js';
 import { GenerateResponseChunk } from '../generate/chunk.js';
+import type { MessageParser } from '../message.js';
 import {
   GenerateActionOptionsSchema,
   GenerateResponseChunkSchema,
@@ -62,7 +63,6 @@ import {
   type Role,
   type RuntimeError,
 } from '../model.js';
-import type { MessageParser } from '../message.js';
 import {
   findMatchingResource,
   resolveResources,
@@ -72,6 +72,7 @@ import { resolveTools, toToolDefinition, type ToolAction } from '../tool.js';
 import { GenerateMiddlewareDef, resolveMiddleware } from './middleware.js';
 import {
   assertValidToolNames,
+  errorDetailsOf,
   resolveResumeOption,
   resolveToolRequests,
 } from './resolve-tool-requests.js';
@@ -459,7 +460,11 @@ async function generateActionTurn(
     cause: unknown,
     base?: GenerateResponseData
   ) =>
-    failureError({ ...request, messages }, cause, { abortSignal, base, parser });
+    failureError({ ...request, messages }, cause, {
+      abortSignal,
+      base,
+      parser,
+    });
 
   let resumed: Awaited<ReturnType<typeof resolveResumeOption>>;
   try {
@@ -492,11 +497,19 @@ async function generateActionTurn(
         ...interruptedResponse,
         error: { status: 'FAILED_PRECONDITION', message },
       },
-      { request: { ...request, messages: rawRequest.messages.slice(0, -1) }, parser }
+      {
+        request: { ...request, messages: rawRequest.messages.slice(0, -1) },
+        parser,
+      }
     );
-    throw new GenerationResponseError(response, message, 'FAILED_PRECONDITION', {
-      message: interruptedResponse.message,
-    });
+    throw new GenerationResponseError(
+      response,
+      message,
+      'FAILED_PRECONDITION',
+      {
+        message: interruptedResponse.message,
+      }
+    );
   }
   if (revisedRequest && revisedRequest !== rawRequest) {
     if (resumedToolMessage && streamingCallback) {
@@ -520,15 +533,23 @@ async function generateActionTurn(
       }
     }
 
-    return await generateHelper(registry, {
-      rawRequest: revisedRequest,
-      middleware,
-      currentTurn,
-      messageIndex: messageIndex + (resumedToolMessage ? 1 : 0),
-      abortSignal,
-      streamingCallback,
-      context,
-    });
+    try {
+      return await generateHelper(registry, {
+        rawRequest: revisedRequest,
+        middleware,
+        currentTurn,
+        messageIndex: messageIndex + (resumedToolMessage ? 1 : 0),
+        abortSignal,
+        streamingCallback,
+        context,
+      });
+    } catch (e) {
+      // A later turn's failure carries its own partial. An error a hook threw
+      // before running that turn does not, and the conversation entering it
+      // is the seam (the Go loop's lastReq).
+      if (partialResponseOf(e)) throw e;
+      throw failAt(revisedRequest.messages, e);
+    }
   }
 
   let chunkRole: Role = 'model';
@@ -649,14 +670,17 @@ async function generateActionTurn(
     // opened it included: a conversation ending in a tool request nothing
     // answered is one no provider accepts back. The turn's accounting stays.
     const message = `Exceeded maximum tool call iterations (${maxIterations})`;
+    const cause = new GenkitError({ status: 'ABORTED', message });
     throw new GenerationAbortedError(
-      failurePartial(
-        request,
-        { status: 'ABORTED', message },
-        { finishReason: 'aborted', base: response.toJSON(), parser }
-      ),
+      failurePartial(request, cause, {
+        finishReason: 'aborted',
+        base: response.toJSON(),
+        parser,
+      }),
       message,
-      'ABORTED'
+      'ABORTED',
+      undefined,
+      { cause }
     );
   }
 
@@ -714,15 +738,23 @@ async function generateActionTurn(
   };
 
   // then recursively call for another loop
-  return await generateHelper(registry, {
-    rawRequest: nextRequest,
-    middleware: middleware,
-    currentTurn: currentTurn + 1,
-    messageIndex: messageIndex + 1,
-    streamingCallback,
-    abortSignal,
-    context,
-  });
+  try {
+    return await generateHelper(registry, {
+      rawRequest: nextRequest,
+      middleware: middleware,
+      currentTurn: currentTurn + 1,
+      messageIndex: messageIndex + 1,
+      streamingCallback,
+      abortSignal,
+      context,
+    });
+  } catch (e) {
+    // A later turn's failure carries its own partial. An error a hook threw
+    // before running that turn does not, and the conversation entering it,
+    // this completed round included, is the seam (the Go loop's lastReq).
+    if (partialResponseOf(e)) throw e;
+    throw failAt(messages, e);
+  }
 }
 
 /** The partial response an error carries, when it is the loop's. */
@@ -766,7 +798,10 @@ function abortReason(abortSignal: AbortSignal): unknown {
 function statusOf(cause: unknown, abortSignal?: AbortSignal): StatusName {
   if (cause instanceof GenkitError) return cause.status;
   const c = cause as { name?: unknown; status?: unknown } | undefined;
-  if (typeof c?.status === 'string' && StatusNameSchema.safeParse(c.status).success) {
+  if (
+    typeof c?.status === 'string' &&
+    StatusNameSchema.safeParse(c.status).success
+  ) {
     return c.status as StatusName;
   }
   if (c?.name === 'TimeoutError') return 'DEADLINE_EXCEEDED';
@@ -782,22 +817,27 @@ function statusOf(cause: unknown, abortSignal?: AbortSignal): StatusName {
 
 /** The cause's own text, without the status prefix a GenkitError adds. */
 function messageOf(cause: unknown): string {
-  return cause instanceof GenkitError
-    ? cause.originalMessage
-    : getErrorMessage(cause);
+  if (cause instanceof GenkitError) return cause.originalMessage;
+  if (cause instanceof Error) return cause.message;
+  const message = (cause as { message?: unknown } | undefined)?.message;
+  return typeof message === 'string' ? message : getErrorMessage(cause);
 }
 
 /**
  * The structured error a partial response carries beside its finish message:
  * the cause classified, so a consumer reading the response as data branches on
- * a status rather than a string.
+ * a status rather than a string. Its details are the cause's own, without the
+ * request or response payloads a nested loop error carries.
  */
-function runtimeErrorOf(cause: unknown, abortSignal?: AbortSignal): RuntimeError {
+function runtimeErrorOf(
+  cause: unknown,
+  abortSignal?: AbortSignal
+): RuntimeError {
+  const details = errorDetailsOf(cause);
   return {
     status: statusOf(cause, abortSignal),
     message: messageOf(cause),
-    ...(cause instanceof GenkitError &&
-      cause.detail !== undefined && { details: cause.detail }),
+    ...(details !== undefined && { details }),
   };
 }
 
@@ -827,9 +867,9 @@ function publicMessageOf(cause: unknown, aborted: boolean): string | undefined {
  * again.
  *
  * `base`, when given, is the failing turn's own model response, whose
- * accounting (usage, custom, raw) the partial keeps; a model call that failed
- * has none. Nothing is aggregated across turns, so a partial's usage means
- * what a final response's does.
+ * accounting (usage and custom data) the partial keeps; a model call that
+ * failed has none. Nothing is aggregated across turns, so a partial's usage
+ * means what a final response's does.
  */
 function failurePartial(
   request: GenerateRequest,
@@ -849,7 +889,6 @@ function failurePartial(
       error,
       usage: opts.base?.usage,
       custom: opts.base?.custom,
-      raw: opts.base?.raw,
     },
     { request, parser: opts.parser }
   );
@@ -908,10 +947,12 @@ function invalidOutputError(
 /**
  * Rewraps an error that left the turn without its partial response. A
  * `generate` hook that caught the loop's error and threw its own drops the
- * conversation the loop completed; the frame's record restores it, the way
- * the Go loop restores `lastPartial`. An error raised outside a turn that
- * did reach the model boundary gets a partial synthesized from that turn's
- * request. An error from before the request resolved is returned as is.
+ * conversation the loop completed; the frame's record restores it verbatim,
+ * the way the Go loop restores `lastPartial`, so the partial still reports
+ * the loop's own failure while the error carries the hook's. An error raised
+ * outside a turn that did reach the model boundary gets a partial synthesized
+ * from that turn's request. An error from before the request resolved is
+ * returned as is.
  */
 function restorePartial(
   cause: unknown,
@@ -919,7 +960,7 @@ function restorePartial(
   abortSignal?: AbortSignal
 ): unknown {
   if (turnState.partial) {
-    const aborted = callerStopped(abortSignal, cause);
+    const aborted = turnState.partial.finishReason === 'aborted';
     const Ctor = aborted ? GenerationAbortedError : GenerationResponseError;
     return new Ctor(
       turnState.partial,

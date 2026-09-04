@@ -336,6 +336,13 @@ describe('GenerateResponse partials', () => {
     assert.throws(() => empty.assertValid(), GenerationResponseError);
     assert.strictEqual(empty.error?.status, 'FAILED_PRECONDITION');
   });
+
+  it('leaves the response unchanged after isValid', () => {
+    const blocked = new GenerateResponse({ finishReason: 'blocked' });
+    assert.strictEqual(blocked.isValid(), false);
+    assert.strictEqual(blocked.error, undefined);
+    assert.strictEqual('error' in blocked.toJSON(), false);
+  });
 });
 
 describe('GenerationResponseError', () => {
@@ -362,7 +369,11 @@ describe('GenerationResponseError', () => {
     assert.deepStrictEqual(err.toJSON(), {
       status: 'UNAVAILABLE',
       message: 'model melted',
-      details: { attempt: 2, finishReason: 'failed', finishMessage: 'model melted' },
+      details: {
+        attempt: 2,
+        finishReason: 'failed',
+        finishMessage: 'model melted',
+      },
     });
     assert.strictEqual(JSON.stringify(err).includes('secret'), false);
   });
@@ -395,7 +406,10 @@ describe('GenerationResponseError', () => {
       'db password rejected',
       'INTERNAL',
       undefined,
-      { cause: new Error('db password rejected'), publicMessage: 'generation failed' }
+      {
+        cause: new Error('db password rejected'),
+        publicMessage: 'generation failed',
+      }
     );
     assert.strictEqual(err.toJSON().message, 'generation failed');
     assert.strictEqual(err.originalMessage, 'db password rejected');

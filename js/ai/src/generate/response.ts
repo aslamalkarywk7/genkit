@@ -145,12 +145,17 @@ export class GenerateResponse<O = unknown> implements ModelResponseData {
   }
 
   isValid(request?: GenerateRequest): boolean {
+    // A read-only check: the error assertValid stamps on a rejected response
+    // is restored afterwards.
+    const error = this.error;
     try {
       this.assertValid();
       this.assertValidSchema(request);
       return true;
     } catch (e) {
       return false;
+    } finally {
+      this.error = error;
     }
   }
 

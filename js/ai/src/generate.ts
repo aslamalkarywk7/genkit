@@ -325,20 +325,32 @@ export class GenerationResponseError extends GenkitError {
         responseMetadata: cause.responseMetadata,
       }),
     });
+    const inherited = cause instanceof GenkitError ? cause.detail : undefined;
     this.detail = {
-      ...(cause instanceof GenkitError && cause.detail),
+      ...(inherited &&
+      typeof inherited === 'object' &&
+      !Array.isArray(inherited)
+        ? inherited
+        : {}),
       ...detail,
       response,
     };
   }
 
+  /**
+   * The wire form: the status, the message, and the response's finish reason
+   * and finish message, with the same text a client is allowed to see (see
+   * {@link GenkitError.publicMessage}). Neither the response nor a request
+   * rides along.
+   */
   toJSON(): HttpErrorWireFormat {
-    const { response, ...details } = this.detail;
+    const { response, request: _request, ...details } = this.detail;
+    const finishMessage = this.publicMessage ?? response?.finishMessage;
     return {
       details: {
         ...details,
         finishReason: response?.finishReason,
-        ...(response?.finishMessage && { finishMessage: response.finishMessage }),
+        ...(finishMessage && { finishMessage }),
       },
       status: this.status,
       message: this.publicMessage ?? this.originalMessage,
@@ -348,12 +360,22 @@ export class GenerationResponseError extends GenkitError {
 
 /**
  * Thrown by the generate loop when it stopped because the caller stopped it
- * rather than because something broke: the request's `abortSignal` fired, the
- * model call was cancelled or timed out, or the loop reached the `maxTurns`
- * limit. `status` says which: `CANCELLED`, `DEADLINE_EXCEEDED`, or `ABORTED`
- * for the turn limit; a cancellation the model reported as a
- * {@link GenkitError} keeps that error's own status. The partial response on
+ * rather than because something broke. The partial response on
  * `detail.response` reports `finishReason` `aborted`.
+ *
+ * The rule reads the request's `abortSignal` and the error's identity, never
+ * a status: the loop stopped on the caller's behalf when the signal had fired
+ * by the time a failure was classified, when the model call rejected with an
+ * `AbortError` or `TimeoutError` (what the platform raises for a cancelled or
+ * timed-out call, whether or not the loop's own signal fired), or when the
+ * loop reached the `maxTurns` limit. A provider answering with a
+ * `GenkitError` of status `ABORTED` or `DEADLINE_EXCEEDED` is a failure, not
+ * a stop.
+ *
+ * `status` is `ABORTED` for the turn limit, `CANCELLED` or
+ * `DEADLINE_EXCEEDED` for a bare cancellation or timeout, and, when the
+ * signal fired while the model reported a `GenkitError`, that error's own
+ * status. A tool that failed after the signal fired reports `CANCELLED`.
  */
 export class GenerationAbortedError extends GenerationResponseError {}
 
@@ -553,19 +575,23 @@ export async function normalizeMiddleware(
  * which are the caller's own or a run of completed [model with tool requests,
  * tool with every response] rounds, and nothing from the failing turn, since
  * a conversation ending in a tool request nothing answered is one no provider
- * accepts. A failed tool discards the whole round it opened, and its own
- * error is reported as INTERNAL with the tool's error on `cause`. Text
- * streamed before the failure still reached `onChunk`.
+ * accepts. A failed tool discards the whole round it opened, and its failure
+ * is reported as INTERNAL: `cause` is that classification and `cause.cause`
+ * the tool's own error. Text streamed before the failure still reached
+ * `onChunk`.
  *
- * Two errors keep their response's message: a response the model completed
- * but post-processing rejected (structured output that does not match the
- * schema), which keeps the model's own finish reason, and a resume whose
- * restarted tool interrupted again, which keeps `finishReason`
- * `interrupted` under its FAILED_PRECONDITION error and is answered with
- * `resume` rather than sent again.
+ * Three errors keep their response's message and the model's own finish
+ * reason: a response the model returned blocked or without a message (a
+ * {@link GenerationBlockedError} for the former), and a response the model
+ * completed but post-processing rejected (structured output that does not
+ * match the schema, with the validation error on `cause`). A resume whose
+ * restarted tool interrupted again keeps `finishReason` `interrupted` under
+ * its FAILED_PRECONDITION error and is answered with `resume` rather than
+ * sent again.
  *
  * Errors raised before the request resolves (an unknown model, tool, or
- * resource, invalid options) carry no response.
+ * resource, invalid options, or a `generate` middleware hook that fails
+ * before running the first turn) carry no response.
  *
  * @param options The options for this generation request.
  * @returns The generated response based on the provided parameters.
