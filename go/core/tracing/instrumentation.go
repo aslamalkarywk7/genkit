@@ -52,18 +52,41 @@ type SpanInfo struct {
 // is deliberately absent: a provider reads it from the value next returns,
 // which is the only point it is known.
 
+// The accessors guard a nil receiver and nil metadata so an out-of-package
+// provider (or a test) that holds a zero-value *SpanInfo does not panic.
+
 // Name is the span name. For a model span it is the fully qualified model name
 // (e.g. "googleai/gemini-flash-latest").
-func (i *SpanInfo) Name() string { return i.metadata.Name }
+func (i *SpanInfo) Name() string {
+	if i == nil || i.metadata == nil {
+		return ""
+	}
+	return i.metadata.Name
+}
 
 // Type is the Genkit span type ("action", "flowStep", "util", ...).
-func (i *SpanInfo) Type() string { return i.metadata.Type }
+func (i *SpanInfo) Type() string {
+	if i == nil || i.metadata == nil {
+		return ""
+	}
+	return i.metadata.Type
+}
 
 // Subtype is the finer categorization ("model", "tool", "flow", ...), or "".
-func (i *SpanInfo) Subtype() string { return i.metadata.Subtype }
+func (i *SpanInfo) Subtype() string {
+	if i == nil || i.metadata == nil {
+		return ""
+	}
+	return i.metadata.Subtype
+}
 
 // Input is the raw Genkit input the action was invoked with, before next runs.
-func (i *SpanInfo) Input() any { return i.metadata.Input }
+func (i *SpanInfo) Input() any {
+	if i == nil || i.metadata == nil {
+		return nil
+	}
+	return i.metadata.Input
+}
 
 // Span is the backend-independent handle a provider exposes for the span it
 // opened. The dispatcher reads TraceInfo to build the composite ids and fans
