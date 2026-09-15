@@ -49,6 +49,7 @@ from genkit import (
     MediaPart,
     TextPart,
 )
+from genkit._core._typing import DocumentData
 
 
 @pytest.mark.asyncio
@@ -322,7 +323,7 @@ def _indexed_embed_content(
     return genai.types.EmbedContentResponse(embeddings=[genai.types.ContentEmbedding(values=[v]) for v in values])
 
 
-def _numbered_docs(count: int) -> list[Document]:
+def _numbered_docs(count: int) -> list[DocumentData]:
     return [Document.from_text(str(i)) for i in range(count)]
 
 
@@ -853,7 +854,7 @@ def _tracked_embed_content(
     return side_effect
 
 
-def _numbered_media_docs(count: int) -> list[Document]:
+def _numbered_media_docs(count: int) -> list[DocumentData]:
     """Documents whose gcsUri carries their index, for the multimodal path."""
     return [Document.from_media(f'gs://bucket/{i}.png', 'image/png') for i in range(count)]
 
