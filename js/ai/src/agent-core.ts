@@ -100,7 +100,10 @@ export interface AgentChat<State = unknown> {
    * {@link sendStream}.
    *
    * A failed turn rejects with an {@link AgentError} naming the resume point,
-   * which the chat has already adopted. An input with neither a message nor
+   * which the chat has already adopted. A turn the caller stopped resolves
+   * with `finishReason: 'aborted'` and the same kind of resume point: the
+   * chat keeps the message when the turn committed it and rolls it back when
+   * it did not. An input with neither a message nor
    * `resume` (`send({})`) runs the turn again on the conversation as it
    * stands, which re-attempts a failed turn without repeating the tool calls
    * it completed; a new message continues from that point like any other.
