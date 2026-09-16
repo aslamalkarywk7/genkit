@@ -4479,6 +4479,80 @@ Now respond to the latest message.`,
       );
     });
 
+    it('rolls back the user message after a turn that fails without committing', async () => {
+      const store = new InMemorySessionStore<{}>();
+      const agent = defineCustomAgent<{}>(
+        new Registry(),
+        { name: 'apiRollback', store },
+        async (sess) => {
+          await sess.run(async () => {
+            throw new Error('boom');
+          });
+          return { message: { role: 'model', content: [{ text: 'ok' }] } };
+        }
+      );
+
+      const chat = agent.chat();
+      await assert.rejects(
+        () => chat.send('hi'),
+        (err: unknown) => {
+          assert.ok(err instanceof AgentError);
+          assert.strictEqual(err.snapshotId, undefined);
+          return true;
+        }
+      );
+      // Nothing committed: the message is not part of any resume point.
+      assert.strictEqual(chat.messages.length, 0);
+      assert.strictEqual(chat.snapshotId, undefined);
+    });
+
+    it('keeps a committed failed turn as the resume point and re-attempts it on an empty input', async () => {
+      const store = new InMemorySessionStore<{}>();
+      let attempts = 0;
+      const agent = defineCustomAgent<{}>(
+        new Registry(),
+        { name: 'apiCommitted', store },
+        async (sess) => {
+          await sess.run(async () => {
+            attempts++;
+            if (attempts === 1) {
+              throw new CommittedTurnError(new Error('boom'));
+            }
+          });
+          return { message: { role: 'model', content: [{ text: 'ok' }] } };
+        }
+      );
+
+      const chat = agent.chat();
+      await assert.rejects(
+        () => chat.send('hi'),
+        (err: unknown) => {
+          assert.ok(err instanceof AgentError);
+          assert.strictEqual(err.status, 'INTERNAL');
+          assert.ok(err.snapshotId, 'the failed turn names its snapshot');
+          return true;
+        }
+      );
+      // The committed turn is the chat's resume point: the message stays.
+      const failedSnapshotId = chat.snapshotId;
+      assert.ok(failedSnapshotId, 'the chat adopts the failed snapshot');
+      assert.strictEqual(chat.messages.length, 1);
+
+      // An empty input runs the turn again on the conversation as it stands.
+      const res = await chat.send({});
+      assert.strictEqual(res.message?.content[0].text, 'ok');
+      assert.ok(chat.snapshotId, 'the re-attempt reports its snapshot');
+      assert.notStrictEqual(chat.snapshotId, failedSnapshotId);
+      const row = await store.getSnapshot({ snapshotId: chat.snapshotId! });
+      assert.strictEqual(row?.status, 'completed');
+      assert.strictEqual(row?.parentId, failedSnapshotId);
+      assert.deepStrictEqual(
+        chat.messages.map((m) => m.content[0].text),
+        ['hi', 'ok']
+      );
+      assert.strictEqual(attempts, 2);
+    });
+
     it('loadChat() restores history from a snapshot (server-managed)', async () => {
       const store = new InMemorySessionStore<{}>();
       const agent = defineCustomAgent<{}>(
