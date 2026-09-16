@@ -241,7 +241,10 @@ export interface AgentOutput<S = unknown> {
   message?: MessageData;
   /**
    * ID of the most recent turn-end snapshot for this invocation. Empty when
-   * no store is configured or no turn committed. When `finishReason` is
+   * no store is configured, or when nothing has been committed yet: a
+   * first-turn failure that rolled back on a fresh session. On a resumed
+   * session whose first turn rolls back it is the resumed snapshot's id. When
+   * `finishReason` is
    * `detached` it is the pending detach snapshot. When `failed`, it is the
    * resume point: the failed turn's own snapshot when the turn committed
    * anything, otherwise the last committed turn's snapshot.
@@ -310,7 +313,6 @@ function toErrorDetailsPayload(detail: unknown): unknown {
     request: _request,
     ...rest
   } = detail as Record<string, any>;
-  if (response === undefined) return detail;
   const inner = response?.error?.details;
   if (inner !== undefined) return inner;
   return Object.keys(rest).length > 0 ? rest : undefined;
@@ -605,9 +607,27 @@ export class SessionRunner<State = unknown> {
         turnIndex: this.turnIndex,
       };
 
+      // The turn's own error, once the failure arm has recorded it. It ends
+      // the loop gracefully; any other error out of the span (a store failing
+      // while the turn was recorded) propagates.
+      let turnError: unknown;
+      let turnThrew = false;
       try {
         await run(`runTurn-${this.turnIndex + 1}`, input, async () => {
-          const turnResult = await fn(input, turnContext);
+          let turnResult: TurnResult | void;
+          try {
+            turnResult = await fn(input, turnContext);
+          } catch (e) {
+            turnThrew = true;
+            turnError = e;
+            const snapshotId = await this.endFailedTurn(e, turnSnapshotId);
+            // Tag the span with the failed turn's snapshot as a success is
+            // tagged with its own, so a trace correlates either with its row.
+            if (snapshotId) {
+              setCustomMetadataAttribute('agent:snapshotId', snapshotId);
+            }
+            throw e;
+          }
           const finishReason = turnResult?.finishReason;
           this.lastTurnFinishReason = finishReason;
           this.lastTurnError = undefined;
@@ -640,47 +660,8 @@ export class SessionRunner<State = unknown> {
           return { state: this.session.getState() };
         });
         this.turnIndex++;
-      } catch (e: any) {
-        // An aborted turn rejects out of `generate` and lands here. Treat it as
-        // `aborted` rather than `failed`: the abort path already persisted the
-        // `aborted` status (the abort-aware mutator would skip a `failed` write
-        // anyway), so we record the finish reason and skip the failed snapshot
-        // write entirely instead of reporting a spurious error.
-        if (this.abortSignal?.aborted) {
-          this.lastTurnFinishReason = 'aborted';
-          this.lastTurnError = undefined;
-          this.lastTurnCommitted = false;
-          this.notifyEndTurn(this.lastSnapshot?.snapshotId, 'aborted');
-          break;
-        }
-
-        // What the turn threw decides what happens to its state: a
-        // CommittedTurnError commits the turn as a resume point, anything else
-        // rolls it back (see `run`). The error the output and the snapshot
-        // report is the underlying cause either way.
-        const committed = isCommittedTurnError(e);
-        const cause = committed ? e.cause : e;
-        const finishReason: AgentFinishReason =
-          (committed && e.result.finishReason) || 'failed';
-        this.lastTurnFinishReason = finishReason;
-        this.lastTurnError = toErrorDetails(cause);
-        this.lastTurnCommitted = committed;
-
-        let snapshotId: string | undefined;
-        if (committed) {
-          // The failed turn's own snapshot, with the error on the row, is the
-          // newest snapshot and so the resume point the failed output reports.
-          snapshotId = await this.maybeSnapshot(
-            'failed',
-            this.lastTurnError,
-            turnSnapshotId,
-            finishReason
-          );
-          this.lastGoodState = this.session.getState();
-          this.lastGoodSnapshotId = snapshotId ?? this.lastGoodSnapshotId;
-        }
-        this.notifyEndTurn(snapshotId, finishReason);
-
+      } catch (e) {
+        if (!turnThrew || e !== turnError) throw e;
         // Graceful failure: rather than propagating the exception (which would
         // discard the action's final return - and with it the resume point and
         // all prior committed turns), stop processing further inputs and let
@@ -689,6 +670,58 @@ export class SessionRunner<State = unknown> {
         break;
       }
     }
+  }
+
+  /**
+   * Records a turn whose handler threw `e`, writing the turn's snapshot when
+   * it committed, and returns that snapshot's id.
+   *
+   * An aborted turn rejects out of `generate` and lands here too. It is
+   * `aborted` rather than `failed`: the abort path already persisted the
+   * `aborted` status (the abort-aware mutator would skip a `failed` write
+   * anyway), so only the finish reason is recorded and no snapshot is written.
+   */
+  private async endFailedTurn(
+    e: unknown,
+    turnSnapshotId: string | undefined
+  ): Promise<string | undefined> {
+    if (this.abortSignal?.aborted) {
+      this.lastTurnFinishReason = 'aborted';
+      this.lastTurnError = undefined;
+      this.lastTurnCommitted = false;
+      this.notifyEndTurn(this.lastSnapshot?.snapshotId, 'aborted');
+      return undefined;
+    }
+
+    // What the turn threw decides what happens to its state: a
+    // CommittedTurnError commits the turn as a resume point, anything else
+    // rolls it back (see `run`). The error the output and the snapshot
+    // report is the underlying cause either way. The turn's own finish
+    // reason, when the result names one, goes on the turn-end chunk and the
+    // row; the invocation reports how it ended.
+    const committed = isCommittedTurnError(e);
+    const cause = committed ? e.cause : e;
+    const finishReason: AgentFinishReason =
+      (committed && e.result?.finishReason) || 'failed';
+    this.lastTurnFinishReason = finishReason;
+    this.lastTurnError = toErrorDetails(cause);
+    this.lastTurnCommitted = committed;
+
+    let snapshotId: string | undefined;
+    if (committed) {
+      // The failed turn's own snapshot, with the error on the row, is the
+      // newest snapshot and so the resume point the failed output reports.
+      snapshotId = await this.maybeSnapshot(
+        'failed',
+        this.lastTurnError,
+        turnSnapshotId,
+        finishReason
+      );
+      this.lastGoodState = this.session.getState();
+      this.lastGoodSnapshotId = snapshotId ?? this.lastGoodSnapshotId;
+    }
+    this.notifyEndTurn(snapshotId, finishReason);
+    return snapshotId;
   }
 
   /** Runs `fn` under the snapshot lock; see {@link snapLock}. */
@@ -743,10 +776,10 @@ export class SessionRunner<State = unknown> {
         updatedAt: new Date().toISOString(),
         state: currentState as SessionState<State>,
         parentId: this.lastSnapshot?.snapshotId,
-        // Default to a resumable `completed` status. The only caller that omits a
-        // status is the post-invocation write (which fires when the handler
-        // mutates state after the last turn); persisting it as `completed` keeps
-        // it a valid resume target under the "only `completed` is resumable" rule.
+        // Default to a `completed` status. The only caller that omits a status
+        // is the post-invocation write, which fires when the handler mutates
+        // state after the last turn of a run that ended well; the row it
+        // writes is a settled resume point.
         status: status ?? 'completed',
         ...(finishReason && { finishReason }),
         error,
@@ -843,14 +876,13 @@ export class SessionRunner<State = unknown> {
     const snapshotId = this.pendingSnapshotId;
     if (!store || !snapshotId) return;
 
+    // An error the agent function threw ends the run as failed whatever its
+    // turns did; otherwise the last turn's own error and finish reason stand.
     const error =
-      cause !== undefined
-        ? toErrorDetails(cause)
-        : this.lastTurnFinishReason === 'failed'
-          ? this.lastTurnError
-          : undefined;
+      cause !== undefined ? toErrorDetails(cause) : this.lastTurnError;
     const status = error ? 'failed' : 'completed';
-    const finishReason = error ? 'failed' : this.lastTurnFinishReason;
+    const finishReason =
+      cause !== undefined ? 'failed' : this.lastTurnFinishReason;
     // The state the row lands with: everything through the last turn that
     // committed, so a rolled-back turn's mutations do not ride onto a row that
     // is a resume point.
@@ -1511,12 +1543,14 @@ export function defineCustomAgent<State = unknown>(
           // last turn. Omitting a status defaults to a resumable `completed`
           // write, which the version guard skips when nothing changed. A
           // detached run has nothing to write here: its finalize records the
-          // cumulative state. Nor does a run whose last turn rolled back: the
-          // live state holds that turn's mutations, and the resume point is
-          // the last committed snapshot.
-          finalSnapshotId = runner.lastTurnCommitted
-            ? await runner.maybeSnapshot()
-            : runner.lastGoodSnapshotId;
+          // cumulative state. Nor does a run that failed: the resume point is
+          // the last committed snapshot, whether that is the failed turn's own
+          // row or its predecessor's, and a completed row on top of it would
+          // displace it as the session's latest.
+          finalSnapshotId =
+            runner.lastTurnCommitted && !runner.lastTurnError
+              ? await runner.maybeSnapshot()
+              : runner.lastGoodSnapshotId;
         } catch (e) {
           fnError = e;
           fnThrew = true;
@@ -1559,20 +1593,21 @@ export function defineCustomAgent<State = unknown>(
       // the resume point. That is the state through the last committed turn,
       // which is the failed turn itself when it committed and its predecessor
       // when it did not, since only a committed turn snapshots and advances
-      // the last-good state. No message: it describes the result of a
-      // completed run.
-      if (runner.lastTurnFinishReason === 'failed' && runner.lastTurnError) {
+      // the last-good state. No message and no artifacts: they describe the
+      // result of a completed run, and the live artifacts would carry a
+      // rolled-back turn's. The turn's own finish reason, when its result
+      // named one, is on the turn-end chunk and the row; the invocation
+      // reports how it ended.
+      if (runner.lastTurnError) {
         const lastGood = (runner.lastGoodState ??
           session.getState()) as SessionState<State>;
         return {
           sessionId: session.sessionId,
           finishReason: 'failed' as AgentFinishReason,
           error: runner.lastTurnError,
-
-          ...(result.artifacts?.length && { artifacts: result.artifacts }),
           // Server-managed: the newest snapshot is the resume point. Undefined
-          // when no turn committed at all (a first-turn failure that rolled
-          // back on a fresh session).
+          // when nothing has been committed yet (a first-turn failure that
+          // rolled back on a fresh session).
           ...(config.store && { snapshotId: runner.lastGoodSnapshotId }),
           // Client-managed: return the resume point's state directly.
           ...(!config.store && { state: toClientState(lastGood) }),

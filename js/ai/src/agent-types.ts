@@ -255,7 +255,10 @@ export interface AgentOutput<S = unknown> {
   message?: MessageData;
   /**
    * ID of the most recent turn-end snapshot for this invocation. Empty when
-   * no store is configured or no turn committed. When `finishReason` is
+   * no store is configured, or when nothing has been committed yet: a
+   * first-turn failure that rolled back on a fresh session. On a resumed
+   * session whose first turn rolls back it is the resumed snapshot's id. When
+   * `finishReason` is
    * `detached` it is the pending detach snapshot. When `failed`, it is the
    * resume point: the failed turn's own snapshot when the turn committed
    * anything, otherwise the last committed turn's snapshot.

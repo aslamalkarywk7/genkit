@@ -781,6 +781,41 @@ describe('Agent', () => {
       assert.deepStrictEqual(out.state.custom, { count: 1 });
     });
 
+    it("records a committed failed turn's snapshotId on the turn span", async () => {
+      spanExporter.exportedSpans = [];
+      const store = new InMemorySessionStore<{}>();
+
+      const flow = defineCustomAgent<{}>(
+        new Registry(),
+        { name: 'turnSpanFailedTest', store },
+        async (sess) => {
+          await sess.run(async () => {
+            throw new CommittedTurnError(new Error('boom'));
+          });
+          return { message: { role: 'model', content: [{ text: 'done' }] } };
+        }
+      );
+
+      const session = flow.streamBidi({});
+      session.send({
+        message: { role: 'user' as const, content: [{ text: 'hi' }] },
+      });
+      session.close();
+      for await (const _ of session.stream) {
+      }
+      const output = await session.output;
+      assert.ok(output.snapshotId, 'the committed turn reports its snapshot');
+
+      const turnSpan = spanExporter.exportedSpans.find(
+        (s) => s.displayName === 'runTurn-1'
+      );
+      assert.ok(turnSpan, 'expected a runTurn-1 span to be exported');
+      assert.strictEqual(
+        turnSpan.attributes['genkit:metadata:agent:snapshotId'],
+        output.snapshotId
+      );
+    });
+
     it('records state on the turn span for a client-managed agent', async () => {
       spanExporter.exportedSpans = [];
       const registry = new Registry();
@@ -3625,6 +3660,198 @@ Now respond to the latest message.`,
       );
     });
 
+    it('reports failed with the error when a committed turn names its own finish reason', async () => {
+      const store = new InMemorySessionStore<{}>();
+      const flow = defineCustomAgent<{}>(
+        new Registry(),
+        { name: 'frOwnReason', store },
+        async (sess) => {
+          await sess.run(async () => {
+            throw new CommittedTurnError(
+              new GenkitError({
+                status: 'RESOURCE_EXHAUSTED',
+                message: 'too long',
+              }),
+              { finishReason: 'length' }
+            );
+          });
+          return { message: { role: 'model', content: [{ text: 'done' }] } };
+        }
+      );
+
+      const session = flow.streamBidi({});
+      session.send({
+        message: { role: 'user' as const, content: [{ text: 'hi' }] },
+      });
+      session.close();
+      const chunks: AgentStreamChunk[] = [];
+      for await (const chunk of session.stream) {
+        chunks.push(chunk);
+      }
+      const output = await session.output;
+
+      // The invocation reports how it ended; the turn's own reason is on the
+      // turn-end chunk and the row.
+      assert.strictEqual(output.finishReason, 'failed');
+      assert.strictEqual(output.error?.status, 'RESOURCE_EXHAUSTED');
+      assert.strictEqual(output.message, undefined);
+      const turnEnd = chunks.find((c) => c.turnEnd)?.turnEnd;
+      assert.strictEqual(turnEnd?.finishReason, 'length');
+      assert.ok(
+        turnEnd?.snapshotId,
+        'the committed turn reports its snapshotId'
+      );
+      assert.strictEqual(output.snapshotId, turnEnd!.snapshotId);
+      const row = await store.getSnapshot({ snapshotId: output.snapshotId! });
+      assert.strictEqual(row?.status, 'failed');
+      assert.strictEqual(row?.finishReason, 'length');
+      assert.strictEqual(row?.error?.status, 'RESOURCE_EXHAUSTED');
+    });
+
+    it('accepts a CommittedTurnError by name without a result', async () => {
+      const store = new InMemorySessionStore<{}>();
+      const flow = defineCustomAgent<{}>(
+        new Registry(),
+        { name: 'frBranded', store },
+        async (sess) => {
+          await sess.run(async () => {
+            throw Object.assign(new Error('boom'), {
+              name: 'CommittedTurnError',
+              cause: new Error('boom'),
+            });
+          });
+          return { message: { role: 'model', content: [{ text: 'done' }] } };
+        }
+      );
+
+      const session = flow.streamBidi({});
+      session.send({
+        message: { role: 'user' as const, content: [{ text: 'hi' }] },
+      });
+      session.close();
+      for await (const _ of session.stream) {
+      }
+      const output = await session.output;
+
+      assert.strictEqual(output.finishReason, 'failed');
+      assert.strictEqual(output.error?.message, 'boom');
+      assert.ok(output.snapshotId, 'the turn committed');
+      const row = await store.getSnapshot({ snapshotId: output.snapshotId! });
+      assert.strictEqual(row?.status, 'failed');
+    });
+
+    it('keeps a failed output free of artifacts', async () => {
+      const store = new InMemorySessionStore<{}>();
+      const flow = defineCustomAgent<{}>(
+        new Registry(),
+        { name: 'frNoArtifacts', store },
+        async (sess) => {
+          await sess.run(async () => {
+            sess.addArtifacts([{ name: 'doc', parts: [{ text: 'draft' }] }]);
+            throw new Error('boom');
+          });
+          return {
+            artifacts: sess.getArtifacts(),
+            message: { role: 'model', content: [{ text: 'done' }] },
+          };
+        }
+      );
+
+      const session = flow.streamBidi({});
+      session.send({
+        message: { role: 'user' as const, content: [{ text: 'hi' }] },
+      });
+      session.close();
+      for await (const _ of session.stream) {
+      }
+      const output = await session.output;
+
+      // The rolled-back turn's artifact is not part of any resume point.
+      assert.strictEqual(output.finishReason, 'failed');
+      assert.strictEqual(output.artifacts, undefined);
+
+      const chat = flow.chat();
+      await assert.rejects(() => chat.send('hi'));
+      assert.deepStrictEqual(chat.artifacts, []);
+    });
+
+    it('does not write a completed row for state mutated after a committed failure', async () => {
+      const store = new InMemorySessionStore<{ count: number }>();
+      const flow = defineCustomAgent<{ count: number }>(
+        new Registry(),
+        { name: 'frPostRunWrite', store },
+        async (sess) => {
+          await sess.run(async () => {
+            sess.updateCustom(() => ({ count: 1 }));
+            throw new CommittedTurnError(new Error('boom'));
+          });
+          // Mutated after the failed turn: not a resume point of its own.
+          sess.updateCustom(() => ({ count: 99 }));
+          return { message: { role: 'model', content: [{ text: 'done' }] } };
+        }
+      );
+
+      const session = flow.streamBidi({});
+      session.send({
+        message: { role: 'user' as const, content: [{ text: 'hi' }] },
+      });
+      session.close();
+      for await (const _ of session.stream) {
+      }
+      const output = await session.output;
+
+      assert.strictEqual(output.finishReason, 'failed');
+      assert.ok(output.snapshotId, 'the failed row is the resume point');
+      const failedRow = await store.getSnapshot({
+        snapshotId: output.snapshotId!,
+      });
+      assert.strictEqual((failedRow!.state.custom as any).count, 1);
+      // The failed row is also the session's latest: nothing was written on
+      // top of it, so resuming by sessionId lands on the same state.
+      const latest = await store.getSnapshot({ sessionId: output.sessionId! });
+      assert.strictEqual(latest?.snapshotId, output.snapshotId);
+    });
+
+    it('strips a request from the details a custom error carries', async () => {
+      const store = new InMemorySessionStore<{}>();
+      const flow = defineCustomAgent<{}>(
+        new Registry(),
+        { name: 'frDetailsRequest', store },
+        async (sess) => {
+          await sess.run(async () => {
+            throw new CommittedTurnError(
+              new GenkitError({
+                status: 'INVALID_ARGUMENT',
+                message: 'bad',
+                detail: {
+                  request: { messages: [{ text: 'secret' }] },
+                  code: 7,
+                },
+              })
+            );
+          });
+          return { message: { role: 'model', content: [{ text: 'done' }] } };
+        }
+      );
+
+      const session = flow.streamBidi({});
+      session.send({
+        message: { role: 'user' as const, content: [{ text: 'hi' }] },
+      });
+      session.close();
+      for await (const _ of session.stream) {
+      }
+      const output = await session.output;
+
+      assert.deepStrictEqual(output.error?.details, { code: 7 });
+      assert.strictEqual(
+        JSON.stringify(output.error).includes('secret'),
+        false
+      );
+      const row = await store.getSnapshot({ snapshotId: output.snapshotId! });
+      assert.deepStrictEqual(row?.error?.details, { code: 7 });
+    });
+
     it('does not validate a never-set custom state against a required-field stateSchema across turns', async () => {
       // Regression: a fresh session must NOT seed custom state with `{}`.
       // If it did, `{}` would be persisted into the first snapshot and then
@@ -4759,6 +4986,41 @@ describe('detach finalize', () => {
     assert.strictEqual(failed.finishReason, 'failed');
     assert.strictEqual(failed.error?.message, 'outside boom');
     assert.ok(failed.state?.messages?.length);
+  });
+
+  it('finalizes a committed failed turn under its own finish reason', async () => {
+    const store = new InMemorySessionStore<{}>();
+    const flow = defineCustomAgent<{}>(
+      new Registry(),
+      { name: 'finalizeOwnReason', store },
+      async (sess) => {
+        await sess.run(async () => {
+          throw new CommittedTurnError(
+            new GenkitError({
+              status: 'RESOURCE_EXHAUSTED',
+              message: 'too long',
+            }),
+            { finishReason: 'length' }
+          );
+        });
+        return { message: { role: 'model', content: [{ text: 'done' }] } };
+      }
+    );
+
+    const session = flow.streamBidi({});
+    session.send({
+      message: { role: 'user', content: [{ text: 'go' }] },
+      detach: true,
+    });
+    const output = await session.output;
+    session.close();
+    const snap = await waitForSnapshotStatus(
+      store,
+      output.snapshotId!,
+      'failed'
+    );
+    assert.strictEqual(snap.finishReason, 'length');
+    assert.strictEqual(snap.error?.status, 'RESOURCE_EXHAUSTED');
   });
 
   it('reuses the pending row for a second detach input', async () => {
