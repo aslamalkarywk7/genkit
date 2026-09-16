@@ -4733,6 +4733,60 @@ Now respond to the latest message.`,
       assert.strictEqual(chat.snapshotId, undefined);
     });
 
+    it('rolls back the message of an uncommitted failure on a chat opened by sessionId', async () => {
+      const store = new InMemorySessionStore<{}>();
+      let attempts = 0;
+      const agent = defineCustomAgent<{}>(
+        new Registry(),
+        { name: 'apiSessionRollback', store },
+        async (sess) => {
+          await sess.run(async () => {
+            attempts++;
+            if (attempts === 2) throw new Error('boom');
+            if (attempts === 3) throw new CommittedTurnError(new Error('kept'));
+          });
+          return { message: { role: 'model', content: [{ text: 'ok' }] } };
+        }
+      );
+
+      const first = agent.chat();
+      await first.send('one');
+      const firstSnapshot = first.snapshotId!;
+      assert.ok(firstSnapshot, 'the first turn reports its snapshot');
+      const sessionId = (await store.getSnapshot({
+        snapshotId: firstSnapshot,
+      }))!.state.sessionId!;
+
+      // No baseline snapshot: the failed output names the previous row, which
+      // is not this turn's, and the turn-end chunk says the turn rolled back.
+      const bySession = agent.chat({ sessionId });
+      await assert.rejects(
+        () => bySession.send('two'),
+        (err: unknown) => {
+          assert.ok(err instanceof AgentError);
+          assert.strictEqual(err.snapshotId, firstSnapshot);
+          return true;
+        }
+      );
+      assert.strictEqual(bySession.messages.length, 0);
+      assert.strictEqual(bySession.snapshotId, firstSnapshot);
+
+      // A committed failure on the same kind of chat keeps its message.
+      const again = agent.chat({ sessionId });
+      await assert.rejects(
+        () => again.send('three'),
+        (err: unknown) => {
+          assert.ok(err instanceof AgentError);
+          assert.notStrictEqual(err.snapshotId, firstSnapshot);
+          return true;
+        }
+      );
+      assert.deepStrictEqual(
+        again.messages.map((m) => m.content[0].text),
+        ['three']
+      );
+    });
+
     it('keeps a committed failed turn as the resume point and re-attempts it on an empty input', async () => {
       const store = new InMemorySessionStore<{}>();
       let attempts = 0;
