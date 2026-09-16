@@ -4654,16 +4654,12 @@ Now respond to the latest message.`,
             sess.session.updateCustom((c) => ({ count: (c?.count ?? 0) + 1 }));
             if (input.message?.content[0]?.text === 'block') {
               enterBlock();
+              // A plain error: the stop, not the error's own status, says
+              // CANCELLED.
               await new Promise<never>((_, reject) => {
                 abortSignal?.addEventListener(
                   'abort',
-                  () =>
-                    reject(
-                      new GenkitError({
-                        status: 'CANCELLED',
-                        message: 'stopped',
-                      })
-                    ),
+                  () => reject(new Error('stopped')),
                   { once: true }
                 );
               });
@@ -4727,12 +4723,13 @@ Now respond to the latest message.`,
       const chunks: AgentStreamChunk[] = [];
       for await (const chunk of session.stream) {
         chunks.push(chunk);
-        if (chunk.turnEnd) ac.abort();
+        if (chunk.turnEnd) ac.abort(new Error('user closed the tab'));
       }
       const output = await session.output;
 
       assert.strictEqual(output.finishReason, 'aborted');
       assert.strictEqual(output.error?.status, 'CANCELLED');
+      assert.strictEqual(output.error?.message, 'user closed the tab');
       const turnEnds = chunks.filter((c) => c.turnEnd).map((c) => c.turnEnd!);
       assert.strictEqual(turnEnds.length, 1);
       assert.ok(
@@ -5795,6 +5792,78 @@ describe('detach finalize', () => {
     assert.deepStrictEqual(
       row?.state?.messages.map((m) => m.content[0].text),
       ['first', 'ack', 'carry on', 'ack']
+    );
+  });
+
+  it("ignores the caller's signal from the detach request on, even while the pending row is being written", async () => {
+    const base = new InMemorySessionStore<{}>();
+    let gateNext = false;
+    let writing: () => void = () => {};
+    const writeStarted = new Promise<void>((resolve) => {
+      writing = resolve;
+    });
+    let releaseWrite: () => void = () => {};
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    // The first write after the gate is armed is the detach's pending row;
+    // it is held until the test releases it.
+    const store = Object.assign(Object.create(base), {
+      getSnapshot: base.getSnapshot.bind(base),
+      onSnapshotStateChange: base.onSnapshotStateChange.bind(base),
+      saveSnapshot: async (id: any, mutator: any, opts: any) => {
+        if (gateNext) {
+          gateNext = false;
+          writing();
+          await writeGate;
+        }
+        return base.saveSnapshot(id, mutator, opts);
+      },
+    }) as InMemorySessionStore<{}>;
+
+    let releaseTurn: () => void = () => {};
+    const turnGate = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    const flow = defineCustomAgent<{}>(
+      new Registry(),
+      { name: 'detachRace', store },
+      async (sess) => {
+        await sess.run(async () => {
+          await turnGate;
+          sess.addMessages([{ role: 'model', content: [{ text: 'ack' }] }]);
+        });
+        return { message: { role: 'model', content: [{ text: 'done' }] } };
+      }
+    );
+
+    const ac = new AbortController();
+    const session = flow.streamBidi({}, { abortSignal: ac.signal });
+    gateNext = true;
+    session.send({
+      message: { role: 'user', content: [{ text: 'go' }] },
+      detach: true,
+    });
+    await writeStarted;
+    // The transport closes behind the detach while its row is in flight.
+    ac.abort();
+    releaseWrite();
+    const output = await session.output;
+    session.close();
+
+    assert.strictEqual(output.finishReason, 'detached');
+    assert.ok(output.snapshotId, 'the detach reports its pending row');
+
+    // The background run was not stopped: it finishes and finalizes the row.
+    releaseTurn();
+    const snap = await waitForSnapshotStatus(
+      store,
+      output.snapshotId!,
+      'completed'
+    );
+    assert.deepStrictEqual(
+      snap.state?.messages.map((m) => m.content[0].text),
+      ['go', 'ack']
     );
   });
 });

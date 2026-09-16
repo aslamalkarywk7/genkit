@@ -73,8 +73,9 @@ export type Artifact = z.infer<typeof ArtifactSchema>;
  * - `completed`: the snapshot captures a settled state.
  * - `aborted`: the caller stopped the invocation: an attached caller aborted
  *   the signal it passed, a detached one called the `abort` companion action,
- *   or the run reached a limit the caller set. The snapshot's `error` says
- *   what stopped it, and its state is what the run committed before the stop:
+ *   or the run reached a limit the caller set. Its `error`, when the stopped
+ *   turn recorded one, says what stopped it, and its state is what the run
+ *   committed before the stop:
  *   the turn in flight rolled back unless it committed. Resume is permitted,
  *   as for `failed`. A row carrying no state is one caught between the
  *   abort's status flip and the finalize that stamps the state on; resume

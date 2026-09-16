@@ -276,15 +276,16 @@ export interface AgentOutput<S = unknown> {
   snapshotId?: string;
   /**
    * Final conversation state (only when client-managed). When `finishReason`
-   * is `failed`, this is the resume point: what the failed turn committed, or
-   * the last successful turn's state when the turn failed before committing
-   * anything.
+   * is `failed` or `aborted`, this is the resume point: what the turn
+   * committed, or the last committed turn's state when the turn ended before
+   * committing anything.
    */
   state?: SessionState<S>;
   finishReason?: AgentFinishReason;
   /**
-   * Present when `finishReason` is `failed`. Carries the original error
-   * details (RuntimeError shape); `state`/`snapshotId` hold the resume point.
+   * Present when `finishReason` is `failed` or `aborted`. Carries the original
+   * error details (RuntimeError shape): what broke, or what stopped the run;
+   * `state`/`snapshotId` hold the resume point.
    */
   error?: {
     status?: string;
@@ -398,14 +399,15 @@ const STOPPED = Symbol('stopped');
  * Normalizes a thrown value into the structured error shape used across the
  * agent (in `AgentOutput.error` and `SessionRunner.lastTurnError`). An error
  * without a status of its own is classified the way `generate` classifies
- * it: a cancellation or a timeout by its name, anything else as INTERNAL.
+ * it: a timeout by its name, a cancellation by its name or by `stopped`
+ * (the caller stopped the run with it), anything else as INTERNAL.
  */
-function toErrorDetails(e: any): AgentErrorDetails {
+function toErrorDetails(e: any, stopped = false): AgentErrorDetails {
   const status =
     e?.status ||
     (e?.name === 'TimeoutError'
       ? 'DEADLINE_EXCEEDED'
-      : e?.name === 'AbortError'
+      : e?.name === 'AbortError' || stopped
         ? 'CANCELLED'
         : 'INTERNAL');
   return {
@@ -566,6 +568,15 @@ export class SessionRunner<State = unknown> {
    * Undefined until the client detaches.
    */
   public pendingSnapshotId?: string;
+  /**
+   * Set as soon as a detach is requested, before its pending-row write
+   * lands. From then on the caller's signal no longer stops the run (see the
+   * agent action's abort wiring): the client that detached may close its
+   * transport while the row is still being written.
+   */
+  public detachRequested: boolean = false;
+  /** The requested detach's pending-row write; see {@link detach}. */
+  private detachInFlight?: Promise<string>;
   /**
    * The pending row as written, kept so the finalize can rebuild it (its
    * lineage and timestamps) even when the store no longer returns it.
@@ -864,7 +875,7 @@ export class SessionRunner<State = unknown> {
       ? 'aborted'
       : (committed && e.result?.finishReason) || 'failed';
     this.lastTurnFinishReason = finishReason;
-    this.lastTurnError = toErrorDetails(cause);
+    this.lastTurnError = toErrorDetails(cause, finishReason === 'aborted');
     this.lastTurnCommitted = committed;
 
     let snapshotId: string | undefined;
@@ -893,7 +904,7 @@ export class SessionRunner<State = unknown> {
    */
   private recordStop(): void {
     this.lastTurnFinishReason = 'aborted';
-    this.lastTurnError = toErrorDetails(stopCause(this.abortSignal!));
+    this.lastTurnError = toErrorDetails(stopCause(this.abortSignal!), true);
   }
 
   /**
@@ -1014,8 +1025,9 @@ export class SessionRunner<State = unknown> {
         message: 'Detach is only supported when a session store is provided.',
       });
     }
-    return this.withSnapLock(async () => {
-      if (this.pendingSnapshotId) return this.pendingSnapshotId;
+    if (this.detachInFlight) return this.detachInFlight;
+    this.detachRequested = true;
+    this.detachInFlight = this.withSnapLock(async () => {
       const snapshotId = this.newSnapshotId || reserveSnapshotId();
       const now = new Date().toISOString();
       const row: SessionSnapshotInput<State> = {
@@ -1039,6 +1051,16 @@ export class SessionRunner<State = unknown> {
       this.onDetach?.(snapshotId);
       return snapshotId;
     });
+    return this.detachInFlight;
+  }
+
+  /**
+   * Resolves once a requested detach has written its pending row, or failed
+   * to: the finalize waits on it, so a row still being written when the run
+   * settles is rewritten rather than left pending.
+   */
+  async detachSettled(): Promise<void> {
+    await this.detachInFlight?.catch(() => {});
   }
 
   /**
@@ -1612,11 +1634,13 @@ export function defineCustomAgent<State = unknown>(
       // the way the abort companion action stops a detached one. An in-flight
       // turn observes the stop through the signal the agent function gets,
       // inputs still queued are dropped, and the invocation resolves with
-      // `aborted` naming the resume point (see SessionRunner.run). A detached
-      // run has no caller left to stop it, so the signal is ignored from then
-      // on: the transport closing behind a detach is not an abort.
+      // `aborted` naming the resume point (see SessionRunner.run). A run that
+      // is detaching or detached has no caller left to stop it, so the signal
+      // is ignored from the detach request on: the transport closing behind
+      // a detach is not an abort, even while the pending row is still being
+      // written.
       const onCallerAbort = () => {
-        if (runner?.isDetached) return;
+        if (runner?.detachRequested) return;
         abortController.abort(arg.abortSignal.reason);
       };
       if (arg.abortSignal.aborted) {
@@ -1805,6 +1829,9 @@ export function defineCustomAgent<State = unknown>(
           session.off('artifactAdded', sendArtifactChunk);
           session.off('artifactUpdated', sendArtifactChunk);
           session.off('customChanged', sendCustomPatch);
+          // A detach whose pending-row write is still in flight lands before
+          // the finalize rewrites that row.
+          if (runner.detachRequested) await runner.detachSettled();
           if (runner.isDetached) {
             await runner.finalizePendingSnapshot(fnThrew ? fnError : undefined);
           }
