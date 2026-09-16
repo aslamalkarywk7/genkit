@@ -180,7 +180,8 @@ function withCompressionMetadata(
   return {
     ...target.metadata,
     contextCompression: {
-      ...((target.metadata?.contextCompression as Record<string, unknown>) ?? {}),
+      ...((target.metadata?.contextCompression as Record<string, unknown>) ??
+        {}),
       ...fields,
     },
   };
@@ -330,7 +331,10 @@ export const contextCompression: GenerateMiddleware<
 
           if (limit === Infinity) return part;
           // Skip if already capped by safety ceiling and still within the safety-cap zone
-          if (limit === maxToolResponseChars && hasCompressionFlag(msg, 'capped')) {
+          if (
+            limit === maxToolResponseChars &&
+            hasCompressionFlag(msg, 'capped')
+          ) {
             return part;
           }
 
@@ -492,10 +496,7 @@ export const contextCompression: GenerateMiddleware<
         const estimatedTokens = Math.ceil(
           estimateMessageChars(rawMessages) / CHARS_PER_TOKEN_ESTIMATE
         );
-        const effectiveTokens = Math.max(
-          lastInputTokens ?? 0,
-          estimatedTokens
-        );
+        const effectiveTokens = Math.max(lastInputTokens ?? 0, estimatedTokens);
 
         const shouldCompress =
           effectiveTokens > maxInputTokens ||
@@ -581,8 +582,7 @@ export const contextCompression: GenerateMiddleware<
         const response = await next(modifiedEnvelope, ctx);
 
         if (isTopLevel) {
-          const finalMeta =
-            turnCompressionMeta ?? latestCompressionMeta;
+          const finalMeta = turnCompressionMeta ?? latestCompressionMeta;
           if (finalMeta) {
             return {
               ...response,

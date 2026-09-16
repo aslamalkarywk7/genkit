@@ -740,10 +740,7 @@ describe('contextCompression middleware', () => {
         {
           role: 'system',
           metadata: { contextCompression: { notice: true } },
-          content: [
-            { text: 'System prompt' },
-            { text: `\n\n${noticeText}` },
-          ],
+          content: [{ text: 'System prompt' }, { text: `\n\n${noticeText}` }],
         },
         { role: 'user', content: [{ text: 'user 1' }] },
         { role: 'model', content: [{ text: 'model 1' }] },
@@ -896,7 +893,9 @@ describe('contextCompression middleware', () => {
       ],
     });
 
-    const secondToolMsg = secondCaptured!.messages.find((m) => m.role === 'tool');
+    const secondToolMsg = secondCaptured!.messages.find(
+      (m) => m.role === 'tool'
+    );
     assert.strictEqual(
       secondToolMsg!.content[0].toolResponse?.output,
       cleanOutput
@@ -1012,7 +1011,9 @@ describe('contextCompression middleware', () => {
       true
     );
     assert.ok(
-      (toolMsgA.content[0].toolResponse?.output as string).startsWith('X'.repeat(50))
+      (toolMsgA.content[0].toolResponse?.output as string).startsWith(
+        'X'.repeat(50)
+      )
     );
   });
 });
