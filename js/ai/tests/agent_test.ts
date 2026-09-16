@@ -5417,6 +5417,54 @@ Now respond to the latest message.`,
       assert.strictEqual(row?.parentId, abortedId);
     });
 
+    it('wait() settles an aborted task only once its finalize has landed', async () => {
+      const store = new InMemorySessionStore<{}>();
+      const agent = defineCustomAgent<{}>(
+        new Registry(),
+        { name: 'apiAbortWait', store },
+        async (sess, { abortSignal }) => {
+          await sess.run(async (input) => {
+            if (input.message?.content[0]?.text === 'block') {
+              await new Promise<never>((_, reject) => {
+                abortSignal?.addEventListener(
+                  'abort',
+                  () => reject(new Error('stopped')),
+                  { once: true }
+                );
+              });
+            }
+            sess.addMessages([{ role: 'model', content: [{ text: 'ack' }] }]);
+          });
+          return { message: { role: 'model', content: [{ text: 'done' }] } };
+        }
+      );
+
+      const chat = agent.chat();
+      await chat.send('first');
+      const task = await chat.detach('block');
+      assert.strictEqual(await task.abort(), 'pending');
+      // The abort flips the row; the finalize that follows stamps the reason
+      // and the state. `wait()` resolves with the second write, not the first.
+      const snapshot = await task.wait({ intervalMs: 5 });
+      assert.strictEqual(snapshot.status, 'aborted');
+      assert.strictEqual(snapshot.finishReason, 'aborted');
+      assert.deepStrictEqual(
+        snapshot.state?.messages.map((m) => m.content[0].text),
+        ['first', 'ack']
+      );
+
+      // And that row is the resume point it says it is.
+      const resumed = agent.chat({ snapshotId: task.snapshotId });
+      const res = await resumed.send('carry on');
+      assert.strictEqual(res.text, 'done');
+      const row = await store.getSnapshot({ snapshotId: resumed.snapshotId! });
+      assert.strictEqual(row?.parentId, task.snapshotId);
+      assert.deepStrictEqual(
+        row?.state?.messages.map((m) => m.content[0].text),
+        ['first', 'ack', 'carry on', 'ack']
+      );
+    });
+
     it('loadChat() restores history from a snapshot (server-managed)', async () => {
       const store = new InMemorySessionStore<{}>();
       const agent = defineCustomAgent<{}>(

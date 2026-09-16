@@ -235,10 +235,18 @@ export interface AgentInterrupt<Input = unknown, Output = unknown> {
 export interface DetachedTask<State = unknown> {
   readonly snapshotId: string;
 
-  /** Yields status until a terminal state. */
+  /**
+   * Yields the snapshot on every poll until it settles: a terminal status,
+   * which for an aborted row means the finalize has stamped the finish reason
+   * and the state the run kept.
+   */
   poll(opts?: { intervalMs?: number }): AsyncIterable<SessionSnapshot<State>>;
 
-  /** Resolves when the task reaches a terminal state. */
+  /**
+   * Resolves with the settled snapshot: completed, failed, expired, or aborted
+   * once the run has recorded the turns it finished, so the row it resolves
+   * with is the one to resume from.
+   */
   wait(opts?: { intervalMs?: number }): Promise<SessionSnapshot<State>>;
 
   /** Aborts the task. */
@@ -321,6 +329,30 @@ const TERMINAL_STATUSES = new Set([
   'aborted',
   'expired',
 ]);
+
+/**
+ * How long an aborted row may go on carrying a heartbeat before the client
+ * stops waiting for its finalize. Matches the server's heartbeat timeout: a
+ * beat older than this says the worker that would write the state is gone.
+ */
+const ABORT_FINALIZE_TIMEOUT_MS = 60_000;
+
+/**
+ * Whether a snapshot has settled into a state the client can act on. An
+ * aborted row reaches its status in two writes: the abort flips it, and the
+ * finalize that follows stamps the finish reason and the state the run
+ * committed, which is what makes the row a resume point. Until that second
+ * write lands the row is still being written, so an aborted row is settled
+ * once its finish reason is on, or once its heartbeat says the write is never
+ * coming: cleared, or stale for longer than the heartbeat timeout.
+ */
+function isSettled(snap: SessionSnapshot<unknown>): boolean {
+  if (!snap.status || !TERMINAL_STATUSES.has(snap.status)) return false;
+  if (snap.status !== 'aborted' || snap.finishReason) return true;
+  if (!snap.heartbeatAt) return true;
+  const last = Date.parse(snap.heartbeatAt);
+  return Number.isNaN(last) || Date.now() - last > ABORT_FINALIZE_TIMEOUT_MS;
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -641,7 +673,7 @@ class DetachedTaskImpl<State = unknown> implements DetachedTask<State> {
 
       if (snap) {
         yield snap;
-        if (snap.status && TERMINAL_STATUSES.has(snap.status)) {
+        if (isSettled(snap)) {
           return;
         }
       }
