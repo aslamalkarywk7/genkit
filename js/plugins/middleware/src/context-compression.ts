@@ -21,14 +21,6 @@ import {
   type MessageData,
   type Part,
 } from 'genkit';
-import { AsyncLocalStorage } from 'node:async_hooks';
-
-interface CompressionExecutionState {
-  lastInputTokens?: number;
-  latestCompressionMeta?: Record<string, unknown> | null;
-}
-
-const compressionStorage = new AsyncLocalStorage<CompressionExecutionState>();
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -37,7 +29,7 @@ const compressionStorage = new AsyncLocalStorage<CompressionExecutionState>();
 export const ToolResponsesOptionsSchema = z.object({
   /**
    * Maximum character length for each tool response content.
-   * Responses exceeding this will be truncated with a `…[truncated]` marker.
+   * Responses exceeding this will be truncated with a `[TRUNCATED: ...]` marker.
    */
   maxChars: z
     .number()
@@ -144,6 +136,11 @@ const DEFAULT_TRUNCATION_NOTICE =
   'latest messages and any conversation summary above.';
 
 /**
+ * Average character-to-token ratio heuristic across natural language and code payloads (~3.5-4 chars/token).
+ */
+const CHARS_PER_TOKEN_ESTIMATE = 3.5;
+
+/**
  * Multimodal LLMs (e.g. Gemini) tokenize images at a fixed rate (~258 tokens)
  * regardless of base64 payload size. 1000 chars / 3.5 ≈ 285 tokens prevents
  * multi-megabyte inline data URIs from causing phantom token spikes on turn 0.
@@ -219,6 +216,20 @@ function estimateMessageChars(messages: MessageData[]): number {
       sum +
       m.content.reduce((pSum, p) => {
         if (p.text) return pSum + p.text.length;
+        if ('reasoning' in p && p.reasoning) {
+          return (
+            pSum +
+            (typeof p.reasoning === 'string'
+              ? p.reasoning.length
+              : stringifyOutput(p.reasoning).length)
+          );
+        }
+        if ('data' in p && p.data !== undefined) {
+          return pSum + stringifyOutput(p.data).length;
+        }
+        if ('custom' in p && p.custom) {
+          return pSum + stringifyOutput(p.custom).length;
+        }
         if (p.media?.url) {
           // Use a fixed character approximation for inline base64 data URIs
           // to reflect fixed image token billing rather than raw string length.
@@ -261,6 +272,9 @@ export const contextCompression: GenerateMiddleware<
     const toolPreserveRecent =
       toolResponseConfig?.preserveRecent ??
       DEFAULT_TOOL_RESPONSE_PRESERVE_RECENT;
+
+    let lastInputTokens: number | undefined;
+    let latestCompressionMeta: Record<string, unknown> | null = null;
 
     const maxMessages = config?.maxMessages;
     const insertTruncationNotice = config?.insertTruncationNotice !== false;
@@ -459,9 +473,8 @@ export const contextCompression: GenerateMiddleware<
     return {
       model: async (req, ctx, next) => {
         const result = await next(req, ctx);
-        const store = compressionStorage.getStore();
-        if (store && result.usage?.inputTokens !== undefined) {
-          store.lastInputTokens = result.usage.inputTokens;
+        if (result.usage?.inputTokens !== undefined) {
+          lastInputTokens = result.usage.inputTokens;
         }
         return result;
       },
@@ -470,131 +483,118 @@ export const contextCompression: GenerateMiddleware<
         const currentTurn = envelope.currentTurn ?? 0;
         const isTopLevel = currentTurn === 0;
 
-        const executeTurn = async () => {
-          const store = compressionStorage.getStore();
-          if (isTopLevel && store) {
-            store.latestCompressionMeta = null;
-            store.lastInputTokens = undefined;
+        if (isTopLevel) {
+          latestCompressionMeta = null;
+          lastInputTokens = undefined;
+        }
+
+        const rawMessages = envelope.request.messages || [];
+        const estimatedTokens = Math.ceil(
+          estimateMessageChars(rawMessages) / CHARS_PER_TOKEN_ESTIMATE
+        );
+        const effectiveTokens = Math.max(
+          lastInputTokens ?? 0,
+          estimatedTokens
+        );
+
+        const shouldCompress =
+          effectiveTokens > maxInputTokens ||
+          (maxMessages !== undefined && rawMessages.length > maxMessages);
+
+        if (!shouldCompress) {
+          const response = await next(envelope, ctx);
+          if (isTopLevel && latestCompressionMeta) {
+            return {
+              ...response,
+              custom: {
+                ...((response.custom as Record<string, unknown>) ?? {}),
+                contextCompression: latestCompressionMeta,
+              },
+            };
+          }
+          return response;
+        }
+
+        const originalCount = rawMessages.length;
+
+        const {
+          messages: compressedMessages,
+          toolResponsesSafetyCapped,
+          toolResponsesTruncated,
+          truncationNoticeInserted,
+        } = await ai.run('contextCompression', rawMessages, async () => {
+          let messages = [...rawMessages];
+          let capped = 0;
+          let truncated = 0;
+          let noticeInserted = false;
+
+          // 1. Tool response limits (Safety cap & Truncation in a single pass)
+          const toolResult = applyToolLimits(messages);
+          messages = toolResult.messages;
+          capped = toolResult.capped;
+          truncated = toolResult.truncated;
+
+          // 2. Message truncation
+          if (maxMessages && messages.length > maxMessages) {
+            const msgResult = applyMessageTruncation(messages);
+            messages = msgResult.messages;
+            noticeInserted = msgResult.noticeInserted;
           }
 
-          const rawMessages = envelope.request.messages || [];
-          const estimatedTokens = Math.ceil(
-            estimateMessageChars(rawMessages) / 3.5
-          );
-          const effectiveTokens = Math.max(
-            store?.lastInputTokens ?? 0,
-            estimatedTokens
-          );
+          return {
+            messages,
+            toolResponsesSafetyCapped: capped,
+            toolResponsesTruncated: truncated,
+            truncationNoticeInserted: noticeInserted,
+          };
+        });
 
-          const shouldCompress =
-            effectiveTokens > maxInputTokens ||
-            (maxMessages !== undefined && rawMessages.length > maxMessages);
+        const compressedCount = compressedMessages.length;
+        const wasCompressed =
+          toolResponsesSafetyCapped > 0 ||
+          toolResponsesTruncated > 0 ||
+          compressedCount < originalCount ||
+          truncationNoticeInserted;
 
-          if (!shouldCompress) {
-            const response = await next(envelope, ctx);
-            if (isTopLevel && store?.latestCompressionMeta) {
-              return {
-                ...response,
-                custom: {
-                  ...((response.custom as Record<string, unknown>) ?? {}),
-                  contextCompression: store.latestCompressionMeta,
-                },
-              };
-            }
-            return response;
-          }
-
-          const originalCount = rawMessages.length;
-
-          const {
-            messages: compressedMessages,
+        let turnCompressionMeta: Record<string, unknown> | null = null;
+        if (wasCompressed) {
+          turnCompressionMeta = {
+            triggered: true,
+            inputTokensBefore: effectiveTokens,
+            messagesOriginal: originalCount,
+            messagesAfter: compressedCount,
             toolResponsesSafetyCapped,
             toolResponsesTruncated,
             truncationNoticeInserted,
-          } = await ai.run('contextCompression', rawMessages, async () => {
-            let messages = [...rawMessages];
-            let capped = 0;
-            let truncated = 0;
-            let noticeInserted = false;
-
-            // 1. Tool response limits (Safety cap & Truncation in a single pass)
-            const toolResult = applyToolLimits(messages);
-            messages = toolResult.messages;
-            capped = toolResult.capped;
-            truncated = toolResult.truncated;
-
-            // 2. Message truncation
-            if (maxMessages && messages.length > maxMessages) {
-              const msgResult = applyMessageTruncation(messages);
-              messages = msgResult.messages;
-              noticeInserted = msgResult.noticeInserted;
-            }
-
-            return {
-              messages,
-              toolResponsesSafetyCapped: capped,
-              toolResponsesTruncated: truncated,
-              truncationNoticeInserted: noticeInserted,
-            };
-          });
-
-          const compressedCount = compressedMessages.length;
-          const wasCompressed =
-            toolResponsesSafetyCapped > 0 ||
-            toolResponsesTruncated > 0 ||
-            compressedCount < originalCount ||
-            truncationNoticeInserted;
-
-          let turnCompressionMeta: Record<string, unknown> | null = null;
-          if (wasCompressed) {
-            turnCompressionMeta = {
-              triggered: true,
-              inputTokensBefore: effectiveTokens,
-              messagesOriginal: originalCount,
-              messagesAfter: compressedCount,
-              toolResponsesSafetyCapped,
-              toolResponsesTruncated,
-              truncationNoticeInserted,
-            };
-            if (store) {
-              store.latestCompressionMeta = turnCompressionMeta;
-            }
-          }
-
-          const modifiedEnvelope = {
-            ...envelope,
-            request: {
-              ...envelope.request,
-              messages: wasCompressed ? compressedMessages : rawMessages,
-            },
           };
+          latestCompressionMeta = turnCompressionMeta;
+        }
 
-          const response = await next(modifiedEnvelope, ctx);
-
-          if (isTopLevel) {
-            const finalMeta =
-              turnCompressionMeta ?? store?.latestCompressionMeta;
-            if (finalMeta) {
-              return {
-                ...response,
-                custom: {
-                  ...((response.custom as Record<string, unknown>) ?? {}),
-                  contextCompression: finalMeta,
-                },
-              };
-            }
-          }
-
-          return response;
+        const modifiedEnvelope = {
+          ...envelope,
+          request: {
+            ...envelope.request,
+            messages: wasCompressed ? compressedMessages : rawMessages,
+          },
         };
 
-        if (isTopLevel || !compressionStorage.getStore()) {
-          return compressionStorage.run(
-            { lastInputTokens: undefined, latestCompressionMeta: null },
-            executeTurn
-          );
+        const response = await next(modifiedEnvelope, ctx);
+
+        if (isTopLevel) {
+          const finalMeta =
+            turnCompressionMeta ?? latestCompressionMeta;
+          if (finalMeta) {
+            return {
+              ...response,
+              custom: {
+                ...((response.custom as Record<string, unknown>) ?? {}),
+                contextCompression: finalMeta,
+              },
+            };
+          }
         }
-        return executeTurn();
+
+        return response;
       },
     };
   }

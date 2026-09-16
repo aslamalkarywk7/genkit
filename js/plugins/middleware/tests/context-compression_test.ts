@@ -100,6 +100,58 @@ describe('contextCompression middleware', () => {
     );
   });
 
+  it('counts reasoning and data parts in estimated tokens on initial turn', async () => {
+    const ai = genkit({});
+    let capturedRequest: GenerateRequest | undefined;
+
+    const pm = ai.defineModel({ name: 'echoModel' }, async (req) => {
+      capturedRequest = req;
+      return {
+        message: { role: 'model', content: [{ text: 'response' }] },
+        usage: { inputTokens: 50 },
+      };
+    });
+
+    const response = (await ai.generate({
+      model: pm,
+      messages: [
+        {
+          role: 'model',
+          content: [
+            { reasoning: 'R'.repeat(400) } as any,
+            { data: { payload: 'D'.repeat(400) } } as any,
+          ],
+        },
+        {
+          role: 'tool',
+          content: [
+            {
+              toolResponse: {
+                name: 'search',
+                ref: '1',
+                output: 'X'.repeat(500),
+              },
+            },
+          ],
+        },
+        { role: 'user', content: [{ text: 'summarize' }] },
+      ],
+      use: [
+        contextCompression({
+          maxInputTokens: 50,
+          toolResponses: { maxChars: 100, preserveRecent: 0 },
+        }),
+      ],
+    })) as any;
+
+    assert.strictEqual(response.text, 'response');
+    assert.strictEqual(response.custom?.contextCompression?.triggered, true);
+    assert.strictEqual(
+      response.custom?.contextCompression?.toolResponsesTruncated,
+      1
+    );
+  });
+
   it('truncates tool responses exceeding maxChars while preserving recent responses', async () => {
     const ai = genkit({});
     let turn = 0;
