@@ -217,14 +217,7 @@ function estimateMessageChars(messages: MessageData[]): number {
       sum +
       m.content.reduce((pSum, p) => {
         if (p.text) return pSum + p.text.length;
-        if ('reasoning' in p && p.reasoning) {
-          return (
-            pSum +
-            (typeof p.reasoning === 'string'
-              ? p.reasoning.length
-              : stringifyOutput(p.reasoning).length)
-          );
-        }
+        if (p.reasoning) return pSum + p.reasoning.length;
         if ('data' in p && p.data !== undefined) {
           return pSum + stringifyOutput(p.data).length;
         }
