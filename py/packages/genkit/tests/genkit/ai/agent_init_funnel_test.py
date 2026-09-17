@@ -24,7 +24,7 @@ from genkit._ai._agents._base import define_custom_agent
 from genkit._ai._agents._client import AgentError
 from genkit._ai._agents._runtime import AgentInitError, SessionRunner
 from genkit._core._action import ActionRunContext
-from genkit._core._error import RuntimeErrorReason, runtime_error_reason
+from genkit._core._error import GenkitError, RuntimeErrorReason, runtime_error_reason
 from genkit._core._registry import Registry
 from genkit._core._typing import (
     AgentFinishReason,
@@ -38,7 +38,8 @@ from genkit._core._typing import (
     SnapshotStatus,
     TextPart,
 )
-from genkit.agent import InMemorySessionStore, TurnContext, TurnResult
+from genkit.exp import Genkit
+from genkit.exp.agent import InMemorySessionStore, TurnContext, TurnResult
 
 
 async def echo_fn(session_runner: SessionRunner, _: ActionRunContext) -> AgentResult:
@@ -184,3 +185,17 @@ async def test_chat_surfaces_missing_snapshot_as_agent_error() -> None:
 
     assert exc.value.status == 'NOT_FOUND'
     assert exc.value.reason is RuntimeErrorReason.SNAPSHOT_NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_unknown_agent_raises_with_action_not_found() -> None:
+    """A missing agent raises at lookup; reason is on the exception."""
+    ai = Genkit()
+
+    with pytest.raises(GenkitError) as exc:
+        await ai.agent('ghost')
+
+    assert exc.value.status == 'NOT_FOUND'
+    assert exc.value.reason is RuntimeErrorReason.ACTION_NOT_FOUND
+    assert "Agent 'ghost' not found" in exc.value.original_message
+    assert 'ACTION_NOT_FOUND' not in exc.value.original_message

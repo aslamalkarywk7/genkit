@@ -6138,20 +6138,6 @@ async def test_unknown_tool_on_request_raises_with_tool_not_found() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unknown_agent_raises_with_action_not_found() -> None:
-    """A missing agent raises at lookup; reason is on the exception."""
-    ai = Genkit()
-
-    with pytest.raises(GenkitError) as raised:
-        await ai.agent('ghost')
-    error = raised.value
-    assert error.status == 'NOT_FOUND'
-    assert error.reason is RuntimeErrorReason.ACTION_NOT_FOUND
-    assert "Agent 'ghost' not found" in error.original_message
-    assert 'ACTION_NOT_FOUND' not in error.original_message
-
-
-@pytest.mark.asyncio
 async def test_generate_without_model_or_default_raises_model_not_found() -> None:
     """generate() with no model and no constructor default is MODEL_NOT_FOUND."""
     ai = Genkit()
