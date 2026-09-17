@@ -231,6 +231,68 @@ describe('resolveResumeOption', () => {
     );
   });
 
+  it('replays a void output after a JSON round trip', async () => {
+    const registry = new Registry();
+    const voidTool = defineTool(
+      registry,
+      { name: 'voidTool', description: 'returns nothing' },
+      async () => {}
+    );
+    const ask = defineTool(
+      registry,
+      {
+        name: 'ask',
+        description: 'asks',
+        inputSchema: z.object({}),
+        outputSchema: z.string(),
+      },
+      async () => {
+        throw new ToolInterruptError({ q: 1 });
+      }
+    );
+
+    const { revisedModelMessage } = await resolveToolRequests(
+      { messages: [] } as any,
+      {
+        role: 'model',
+        content: [
+          { toolRequest: { name: 'voidTool', ref: 'v1', input: {} } },
+          { toolRequest: { name: 'ask', ref: 'a1', input: {} } },
+        ],
+      },
+      [voidTool, ask]
+    );
+    // Stashed as null: a session store's JSON drops a key holding undefined.
+    assert.strictEqual(
+      revisedModelMessage?.content[0].metadata?.pendingOutput,
+      null
+    );
+
+    const persisted = JSON.parse(JSON.stringify(revisedModelMessage));
+    const result = await resolveResumeOption(
+      registry,
+      {
+        messages: [{ role: 'user', content: [{ text: 'hi' }] }, persisted],
+        resume: {
+          respond: [
+            { toolResponse: { name: 'ask', ref: 'a1', output: 'yes' } },
+          ],
+        },
+      } as any,
+      [voidTool, ask]
+    );
+    assert.deepStrictEqual(
+      result.toolMessage?.content.map((p: any) => [
+        p.toolResponse.ref,
+        p.toolResponse.output,
+      ]),
+      [
+        ['v1', null],
+        ['a1', 'yes'],
+      ]
+    );
+  });
+
   it('emits resumed tool responses in request order', async () => {
     const registry = new Registry();
     const slowTool = defineTool(

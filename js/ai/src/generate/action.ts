@@ -175,7 +175,7 @@ export async function generateHelper(
         // A failure can still carry a result: the loop throws the
         // conversation it completed alongside its error. Record it so the
         // span shows what the call produced and not only that it stopped.
-        const partial = partialResponseOf(e);
+        const partial = partialResponseOf(e, registry);
         if (partial) metadata.output = JSON.stringify(partial.toJSON());
         throw e;
       }
@@ -321,7 +321,7 @@ async function generateActionImpl(
         turnState,
       });
     } catch (e) {
-      const partial = partialResponseOf(e);
+      const partial = partialResponseOf(e, registry);
       if (partial) turnState.partial = partial;
       throw e;
     }
@@ -397,8 +397,8 @@ async function generateActionImpl(
       });
     }
   } catch (e) {
-    if (partialResponseOf(e)) throw e;
-    throw restorePartial(e, turnState, abortSignal);
+    if (partialResponseOf(e, registry)) throw e;
+    throw restorePartial(e, turnState, registry, abortSignal);
   }
 }
 
@@ -467,6 +467,7 @@ async function generateActionTurn(
       abortSignal,
       base,
       parser,
+      registry,
     });
 
   let resumed: Awaited<ReturnType<typeof resolveResumeOption>>;
@@ -495,15 +496,18 @@ async function generateActionTurn(
     // because it is answered with `resume` rather than sent again.
     const message =
       'One or more tools triggered an interrupt during a restarted execution.';
-    const response = new GenerateResponse(
-      {
-        ...interruptedResponse,
-        error: { status: 'FAILED_PRECONDITION', message },
-      },
-      {
-        request: { ...request, messages: rawRequest.messages.slice(0, -1) },
-        parser,
-      }
+    const response = ownedBy(
+      new GenerateResponse(
+        {
+          ...interruptedResponse,
+          error: { status: 'FAILED_PRECONDITION', message },
+        },
+        {
+          request: { ...request, messages: rawRequest.messages.slice(0, -1) },
+          parser,
+        }
+      ),
+      registry
     );
     throw withThrownForm(
       new GenerationResponseError(response, message, 'FAILED_PRECONDITION', {
@@ -552,7 +556,7 @@ async function generateActionTurn(
       // A later turn's failure carries its own partial. An error a hook threw
       // before running that turn does not, and the conversation entering it
       // is the seam (the Go loop's lastReq).
-      if (partialResponseOf(e)) throw e;
+      if (partialResponseOf(e, registry)) throw e;
       throw failAt(revisedRequest.messages, e);
     }
   }
@@ -641,6 +645,7 @@ async function generateActionTurn(
       parser,
     });
   }
+  ownedBy(response, registry);
   if (model.__action.actionType === 'background-model') {
     return response.toJSON();
   }
@@ -682,6 +687,7 @@ async function generateActionTurn(
           finishReason: 'aborted',
           base: response.toJSON(),
           parser,
+          registry,
         }),
         message,
         'ABORTED',
@@ -689,8 +695,9 @@ async function generateActionTurn(
         { cause }
       ),
       // What a caller catches: the error the limit has always thrown, with
-      // the refused round's own response.
-      new GenerationResponseError(response, message, 'ABORTED', { request })
+      // the refused round's own response, as the subclass that names a stop
+      // so a caller's own turn loop can tell it from a break.
+      new GenerationAbortedError(response, message, 'ABORTED', { request })
     );
   }
 
@@ -762,15 +769,41 @@ async function generateActionTurn(
     // A later turn's failure carries its own partial. An error a hook threw
     // before running that turn does not, and the conversation entering it,
     // this completed round included, is the seam (the Go loop's lastReq).
-    if (partialResponseOf(e)) throw e;
+    if (partialResponseOf(e, registry)) throw e;
     throw failAt(messages, e);
   }
 }
 
-/** The partial response an error carries, when it is the loop's. */
-export function partialResponseOf(e: unknown): GenerateResponse | undefined {
+/**
+ * The responses this loop built, keyed to the registry the invocation runs
+ * under: `generate` gives every invocation its own child registry, which
+ * every turn and hook of that invocation shares and a nested `generate` (one
+ * a hook ran) does not.
+ */
+const loopPartials = new WeakMap<GenerateResponse, Registry>();
+
+function ownedBy<R extends GenerateResponse>(
+  response: R,
+  registry: Registry
+): R {
+  loopPartials.set(response, registry);
+  return response;
+}
+
+/**
+ * The partial response an error carries, when it is this loop's own. The
+ * check is by identity rather than shape: an error from a nested `generate`
+ * a hook ran carries that loop's response, not this one's partial.
+ */
+export function partialResponseOf(
+  e: unknown,
+  registry: Registry
+): GenerateResponse | undefined {
   const response = (e as any)?.detail?.response;
-  return response instanceof GenerateResponse ? response : undefined;
+  return response instanceof GenerateResponse &&
+    loopPartials.get(response) === registry
+    ? response
+    : undefined;
 }
 
 /**
@@ -789,12 +822,25 @@ function withThrownForm<E extends object>(error: E, thrown: unknown): E {
   return error;
 }
 
-/** What `generate` throws for `e`; see `thrownForms`. */
+/**
+ * What `generate` throws for `e`; see `thrownForms`. The wrapper passed the
+ * loop's spans on its way out, and the error a caller catches carries the
+ * same marks, so an enclosing span does not claim the failure again.
+ */
 export function errorToThrow(e: unknown): unknown {
-  if (typeof e === 'object' && e !== null && thrownForms.has(e)) {
-    return thrownForms.get(e);
+  if (typeof e !== 'object' || e === null || !thrownForms.has(e)) return e;
+  const thrown = thrownForms.get(e);
+  if (typeof thrown === 'object' && thrown !== null) {
+    for (const mark of ['ignoreFailedSpan', 'traceId'] as const) {
+      if (
+        (e as any)[mark] !== undefined &&
+        (thrown as any)[mark] === undefined
+      ) {
+        (thrown as any)[mark] = (e as any)[mark];
+      }
+    }
   }
-  return e;
+  return thrown;
 }
 
 /**
@@ -919,21 +965,25 @@ function failurePartial(
   cause: unknown,
   opts: {
     finishReason: 'failed' | 'aborted';
+    registry: Registry;
     abortSignal?: AbortSignal;
     base?: GenerateResponseData;
     parser?: MessageParser<any>;
   }
 ): GenerateResponse {
   const error = runtimeErrorOf(cause, opts.abortSignal);
-  return new GenerateResponse(
-    {
-      finishReason: opts.finishReason,
-      finishMessage: error.message,
-      error,
-      usage: opts.base?.usage,
-      custom: opts.base?.custom,
-    },
-    { request, parser: opts.parser }
+  return ownedBy(
+    new GenerateResponse(
+      {
+        finishReason: opts.finishReason,
+        finishMessage: error.message,
+        error,
+        usage: opts.base?.usage,
+        custom: opts.base?.custom,
+      },
+      { request, parser: opts.parser }
+    ),
+    opts.registry
   );
 }
 
@@ -947,6 +997,7 @@ function failureError(
   request: GenerateRequest,
   cause: unknown,
   opts: {
+    registry: Registry;
     abortSignal?: AbortSignal;
     base?: GenerateResponseData;
     parser?: MessageParser<any>;
@@ -1007,13 +1058,18 @@ function invalidOutputError(
 function restorePartial(
   cause: unknown,
   turnState: TurnState,
+  registry: Registry,
   abortSignal?: AbortSignal
 ): unknown {
   if (turnState.partial) {
     const partial = turnState.partial;
     const aborted = partial.finishReason === 'aborted';
     partial.error = runtimeErrorOf(cause, abortSignal);
-    partial.finishMessage = partial.error.message;
+    // A loop stop's finish message is its error's text; a response the model
+    // completed keeps the model's own.
+    if (partial.finishReason === 'failed' || aborted) {
+      partial.finishMessage = partial.error.message;
+    }
     const Ctor = aborted ? GenerationAbortedError : GenerationResponseError;
     return withThrownForm(
       new Ctor(
@@ -1023,11 +1079,11 @@ function restorePartial(
         undefined,
         { cause, publicMessage: publicMessageOf(cause, aborted) }
       ),
-      cause
+      ownError(cause)
     );
   }
   if (turnState.request) {
-    return failureError(turnState.request, cause, { abortSignal });
+    return failureError(turnState.request, cause, { abortSignal, registry });
   }
   return cause;
 }

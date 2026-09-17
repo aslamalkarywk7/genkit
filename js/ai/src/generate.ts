@@ -374,9 +374,12 @@ export class GenerationResponseError extends GenkitError {
 /**
  * Built by the generate loop when it stopped because the caller stopped it
  * rather than because something broke. The partial response on
- * `detail.response` reports `finishReason` `aborted`. Like its parent it does
- * not reach application code: `generate` returns the response or throws the
- * cause (see {@link GenerationResponseError}).
+ * `detail.response` reports `finishReason` `aborted`. A caller catches one
+ * for the `maxTurns` limit, which `generate` has always thrown as a
+ * {@link GenerationResponseError} with status `ABORTED` and now throws as
+ * this subclass; every other stop reaches a caller as the cancellation or
+ * timeout error itself, or, with `throwOnError: false`, as a response that
+ * reports `aborted`.
  *
  * The rule reads the request's `abortSignal` and the error's identity, never
  * a status: the loop stopped on the caller's behalf when the signal had fired
@@ -668,7 +671,7 @@ export async function generate<
     // that asked for failures on the response gets that response; any other
     // gets the error the failure threw on its own.
     if (resolvedOptions.throwOnError === false) {
-      const partial = partialResponseOf(e);
+      const partial = partialResponseOf(e, registry);
       if (partial) return partial as GenerateResponse<z.infer<O>>;
     }
     throw errorToThrow(e);

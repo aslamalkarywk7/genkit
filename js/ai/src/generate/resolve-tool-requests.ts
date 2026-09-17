@@ -157,7 +157,9 @@ export function toPendingOutput(
 ): ToolRequestPart {
   const metadata: Record<string, any> = {
     ...part.metadata,
-    pendingOutput: response.toolResponse.output,
+    // A void output is stashed as null: it must survive a session store's
+    // JSON, which drops a key holding undefined.
+    pendingOutput: response.toolResponse.output ?? null,
   };
   if (response.toolResponse.content?.length) {
     metadata.pendingContent = response.toolResponse.content;
@@ -180,12 +182,10 @@ export async function resolveToolRequest(
 }> {
   const tool = toolMap[part.toolRequest.name];
   if (!tool) {
-    // No request on the detail: the partial response the loop attaches
-    // carries the conversation, and a detail here would repeat it on the
-    // wire.
     throw new GenkitError({
       status: 'NOT_FOUND',
       message: `Tool ${part.toolRequest.name} not found`,
+      detail: { request: rawRequest },
     });
   }
 

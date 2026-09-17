@@ -27,6 +27,7 @@ import * as assert from 'assert';
 import { beforeEach, describe, it } from 'node:test';
 import {
   GenerateResponse,
+  GenerationAbortedError,
   GenerationBlockedError,
   GenerationResponseError,
   generate,
@@ -1740,6 +1741,97 @@ describe('generate failures', () => {
         false
       );
     });
+
+    it('does not mistake the failure of a nested generate a hook ran for its own', async () => {
+      defineModel(registry, { name: 'censor' }, async () => ({
+        finishReason: 'blocked',
+        finishMessage: 'safety',
+      }));
+      defineTool(
+        registry,
+        { name: 'badTool', description: 'bad' },
+        async () => {
+          throw new Error('db exploded');
+        }
+      );
+      defineToolLoopModel('badTool', () => ({
+        message: { role: 'model', content: [{ text: 'unreachable' }] },
+        finishReason: 'stop',
+      }));
+      // The hook falls back to another generate call, which fails in turn.
+      const fallback = generateMiddleware({ name: 'fallback' }, () => ({
+        generate: async (envelope, ctx, next) => {
+          try {
+            return await next(envelope, ctx);
+          } catch {
+            await generate(registry, { model: 'censor', prompt: 'INNER' });
+            throw new Error('unreachable');
+          }
+        },
+      }));
+
+      const res = await generateReturning({
+        model: 'loopModel',
+        prompt: 'outer',
+        tools: ['badTool'],
+        use: [fallback()],
+      });
+      // The outer loop's own partial, with the hook's error: the inner
+      // call's blocked response is that call's, not this one's.
+      assert.strictEqual(res.finishReason, 'failed');
+      assert.strictEqual(res.error?.status, 'FAILED_PRECONDITION');
+      assert.ok(res.error?.message.includes('blocked'), res.error?.message);
+      assert.deepStrictEqual(
+        res.messages.map((m) => m.content[0].text),
+        ['outer']
+      );
+      assert.deepStrictEqual(res.usage, { inputTokens: 1 });
+
+      // Before the first turn there is nothing of this loop's to return, so
+      // the inner error is thrown.
+      const deny = generateMiddleware({ name: 'deny' }, () => ({
+        generate: async () => {
+          await generate(registry, { model: 'censor', prompt: 'INNER' });
+          throw new Error('unreachable');
+        },
+      }));
+      await assert.rejects(
+        generateReturning({
+          model: 'loopModel',
+          prompt: 'outer',
+          use: [deny()],
+        }),
+        (e: unknown) => e instanceof GenerationBlockedError
+      );
+    });
+
+    it("keeps the model's finish message when a hook replaces a blocked response's error", async () => {
+      defineModel(registry, { name: 'censor' }, async () => ({
+        finishReason: 'blocked',
+        finishMessage: 'safety',
+      }));
+      const dropping = generateMiddleware({ name: 'dropping' }, () => ({
+        generate: async (envelope, ctx, next) => {
+          try {
+            return await next(envelope, ctx);
+          } catch {
+            throw new Error('hook replaced');
+          }
+        },
+      }));
+
+      const res = await generateReturning({
+        model: 'censor',
+        prompt: 'go',
+        use: [dropping()],
+      });
+      assert.strictEqual(res.finishReason, 'blocked');
+      assert.strictEqual(res.finishMessage, 'safety');
+      assert.deepStrictEqual(res.error, {
+        status: 'INTERNAL',
+        message: 'hook replaced',
+      });
+    });
   });
 
   describe('thrown (the default)', () => {
@@ -1838,6 +1930,7 @@ describe('generate failures', () => {
           assert.ok(e instanceof ValidationError);
           assert.strictEqual(e.status, 'INVALID_ARGUMENT');
           assert.strictEqual(e.detail?.response, undefined);
+          assert.strictEqual((e as any).ignoreFailedSpan, true);
           return true;
         }
       );
@@ -1866,11 +1959,14 @@ describe('generate failures', () => {
         }),
         (e: any) => {
           assert.ok(e instanceof GenerationResponseError);
+          assert.ok(e instanceof GenerationAbortedError);
           assert.strictEqual(e.status, 'ABORTED');
           assert.strictEqual(
             e.originalMessage,
             'Exceeded maximum tool call iterations (1)'
           );
+          // The loop's spans already marked the failure's source.
+          assert.strictEqual(e.ignoreFailedSpan, true);
           // The round the limit refused, as the loop has always reported it.
           assert.strictEqual(
             e.detail.response.message?.content[0].toolRequest?.name,
@@ -2011,6 +2107,61 @@ describe('generate failures', () => {
           use: [dropping()],
         }),
         (e: unknown) => e === replaced
+      );
+    });
+
+    it("throws the tool's own error when a hook rethrows the loop's cause", async () => {
+      const boom = new Error('db password rejected');
+      defineTool(
+        registry,
+        { name: 'badTool', description: 'bad' },
+        async () => {
+          throw boom;
+        }
+      );
+      defineToolLoopModel('badTool', () => ({
+        message: { role: 'model', content: [{ text: 'unreachable' }] },
+        finishReason: 'stop',
+      }));
+      const unwrapping = generateMiddleware({ name: 'unwrapping' }, () => ({
+        generate: async (envelope, ctx, next) => {
+          try {
+            return await next(envelope, ctx);
+          } catch (e: any) {
+            throw e.cause;
+          }
+        },
+      }));
+
+      await assert.rejects(
+        generate(registry, {
+          model: 'loopModel',
+          prompt: 'go',
+          tools: ['badTool'],
+          use: [unwrapping()],
+        }),
+        (e: unknown) => e === boom
+      );
+    });
+
+    it('throws NOT_FOUND with the request when the model requests an unknown tool', async () => {
+      defineOkTool();
+      defineToolLoopModel('ghost', () => ({
+        message: { role: 'model', content: [{ text: 'unreachable' }] },
+        finishReason: 'stop',
+      }));
+
+      await assert.rejects(
+        generate(registry, {
+          model: 'loopModel',
+          prompt: 'go',
+          tools: ['okTool'],
+        }),
+        (e: any) => {
+          assert.strictEqual(e.status, 'NOT_FOUND');
+          assert.ok(e.detail?.request, 'the request rides on the detail');
+          return true;
+        }
       );
     });
 
