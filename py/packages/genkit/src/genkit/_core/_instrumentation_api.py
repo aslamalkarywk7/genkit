@@ -18,11 +18,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass, field
 from typing import Protocol, TypeVar, runtime_checkable
 
 T = TypeVar('T')
+
+
+class SpanNext(Protocol[T]):
+    """``next()`` or ``next(span)``. A logger that does not mint ids calls ``next()``."""
+
+    def __call__(self, span: SpanContext | None = None) -> Awaitable[T]: ...
 
 
 @dataclass(frozen=True)
@@ -72,5 +78,16 @@ class Instrumentation(Protocol):
     async def run_in_new_span(
         self,
         metadata: SpanMetadata,
-        next: Callable[[SpanContext], Awaitable[T]],
+        next: SpanNext[T],
     ) -> T: ...
+
+
+@runtime_checkable
+class DisposableInstrumentation(Protocol):
+    """Optional: a provider that holds a subscription or client.
+
+    ``reset_instrumentation`` calls ``dispose`` so a leftover log handler
+    cannot keep posting after tests tear down.
+    """
+
+    def dispose(self) -> None: ...

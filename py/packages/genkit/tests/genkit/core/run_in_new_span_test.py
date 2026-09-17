@@ -430,11 +430,7 @@ async def test_action_context_telemetry_sanitizes_unserializable(exporter: InMem
     assert isinstance(context_attr, str)
     context_json = json.loads(context_attr)
 
-    # Assertions
-    assert context_json['auth']['user_id'] == 123
-    assert context_json['auth']['token'] == 'secret_token'
-    assert context_json['auth']['raw_connection'] == 'Unserializable'
-
+    assert context_json['auth'] == '<redacted>'
     assert context_json['serializable_list'] == [1, 'two', {'nested_key': 'nested_val'}]
     assert context_json['unserializable_list'] == [1, 'Unserializable', 3]
     assert context_json['top_level_unserializable'] == 'Unserializable'

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess  # noqa: S404
 import sys
@@ -26,6 +27,10 @@ from opentelemetry.trace import NoOpTracerProvider
 
 from genkit import ActionKind, Genkit
 from genkit._core._action import Action
+from genkit._core._direct_http_instrumentation import (
+    DirectHttpInstrumentation,
+    flush_direct_http_instrumentations,
+)
 from genkit._core._environment import GENKIT_ENV
 from genkit._core._instrumentation import (
     NoopSpanContext,
@@ -42,6 +47,7 @@ from genkit._core._otel_instrumentation import (
 from genkit._core._reflection_v2 import ReflectionServerV2
 from genkit._core._registry import Registry
 from genkit.telemetry import (
+    GenkitBuiltinInstrumentation,
     OtelInstrumentation,
     configure_instrumentation,
     is_instrumented_by,
@@ -67,6 +73,7 @@ def _flush_exporters_in_provider(provider: TracerProvider) -> None:
 
 
 def _force_flush() -> None:
+    flush_direct_http_instrumentations()
     for inst in instrumentations:
         if isinstance(inst, OtelInstrumentation) and inst._tracer_provider is not None:
             inst._tracer_provider.force_flush()
@@ -111,13 +118,14 @@ async def test_a_plain_script_returns_an_answer_and_no_trace_ids() -> None:
     assert result.trace_id == ''
     assert result.span_id == ''
     assert not is_instrumented_by(OtelInstrumentation)
+    assert not is_instrumented_by(GenkitBuiltinInstrumentation)
 
 
 @pytest.mark.asyncio
 async def test_genkit_start_gives_the_developer_ui_real_trace_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Under genkit start, Genkit() installs OTel so the Traces tab gets real ids."""
+    """Under genkit start, Genkit() POSTs traces so the Traces tab gets real ids."""
     monkeypatch.setenv(GENKIT_ENV, 'dev')
     monkeypatch.setenv('GENKIT_TELEMETRY_SERVER', 'http://127.0.0.1:4033')
 
@@ -125,7 +133,8 @@ async def test_genkit_start_gives_the_developer_ui_real_trace_ids(
     action = Action(name='joke', kind=ActionKind.FLOW, fn=_joke)
     result = await action.run()
 
-    assert is_instrumented_by(OtelInstrumentation)
+    assert is_instrumented_by(GenkitBuiltinInstrumentation)
+    assert not is_instrumented_by(OtelInstrumentation)
     assert _hex_id(result.trace_id, 32)
     assert _hex_id(result.span_id, 16)
 
@@ -134,7 +143,7 @@ async def test_genkit_start_gives_the_developer_ui_real_trace_ids(
 async def test_configuring_otel_yourself_in_dev_stacks_dev_instrumentation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """configure_instrumentation(OtelInstrumentation()) in dev mode stacks dev instrumentation."""
+    """configure_instrumentation(OtelInstrumentation()) in dev still adds the UI poster."""
     monkeypatch.setenv(GENKIT_ENV, 'dev')
     monkeypatch.setenv('GENKIT_TELEMETRY_SERVER', 'http://127.0.0.1:4033')
 
@@ -144,7 +153,7 @@ async def test_configuring_otel_yourself_in_dev_stacks_dev_instrumentation(
 
     assert len(instrumentations) == 2
     assert instrumentations[0] == yours
-    assert isinstance(instrumentations[1], OtelInstrumentation)
+    assert isinstance(instrumentations[1], GenkitBuiltinInstrumentation)
 
 
 @pytest.mark.asyncio
@@ -329,7 +338,8 @@ async def test_enable_under_genkit_start_leaves_developer_ui_inject_to_genkit(
     action = Action(name='joke', kind=ActionKind.FLOW, fn=_joke)
     result = await action.run()
 
-    assert is_instrumented_by(OtelInstrumentation)
+    assert is_instrumented_by(GenkitBuiltinInstrumentation)
+    assert not is_instrumented_by(OtelInstrumentation)
     assert _hex_id(result.trace_id, 32)
 
 
@@ -414,14 +424,15 @@ async def test_handshake_url_in_dev_turns_tracing_on(
     url = f'http://127.0.0.1:{server.server_address[1]}'
     try:
         Genkit()
-        assert not is_instrumented_by(OtelInstrumentation)
+        assert not is_instrumented_by(GenkitBuiltinInstrumentation)
 
         _handshake_server().apply_handshake_telemetry(url)
         action = Action(name='joke', kind=ActionKind.FLOW, fn=_joke)
         result = await action.run()
         _force_flush()
 
-        assert is_instrumented_by(OtelInstrumentation)
+        assert is_instrumented_by(GenkitBuiltinInstrumentation)
+        assert not is_instrumented_by(OtelInstrumentation)
         assert _hex_id(result.trace_id, 32)
         assert _hex_id(result.span_id, 16)
         assert posts
@@ -449,7 +460,7 @@ async def test_leftover_collector_url_does_not_drop_handshake_url(
         result = await action.run()
         _force_flush()
 
-        assert is_instrumented_by(OtelInstrumentation)
+        assert is_instrumented_by(GenkitBuiltinInstrumentation)
         assert _hex_id(result.trace_id, 32)
         assert live_posts
         assert not leftover_posts
@@ -467,11 +478,11 @@ async def test_handshake_skips_when_otel_already_mints(
     monkeypatch.setenv('GENKIT_TELEMETRY_SERVER', 'http://127.0.0.1:4033')
 
     Genkit()
-    seen = _capture_handshake_exporters(monkeypatch)
+    before = list(instrumentations)
     _handshake_server().apply_handshake_telemetry('http://127.0.0.1:4041')
 
-    assert is_instrumented_by(OtelInstrumentation)
-    assert seen == []
+    assert is_instrumented_by(GenkitBuiltinInstrumentation)
+    assert instrumentations == before
 
 
 @pytest.mark.asyncio
@@ -491,7 +502,7 @@ async def test_notify_url_in_dev_turns_tracing_on(monkeypatch: pytest.MonkeyPatc
     action = Action(name='joke', kind=ActionKind.FLOW, fn=_joke)
     result = await action.run()
 
-    assert is_instrumented_by(OtelInstrumentation)
+    assert is_instrumented_by(GenkitBuiltinInstrumentation)
     assert _hex_id(result.trace_id, 32)
 
 
@@ -513,6 +524,7 @@ async def test_already_minting_hangs_handshake_mailbox(
         result = await action.run()
         _force_flush()
 
+        assert is_instrumented_by(GenkitBuiltinInstrumentation)
         assert _hex_id(result.trace_id, 32)
         assert posts
     finally:
@@ -807,3 +819,187 @@ async def test_failing_custom_provider_does_not_break_other_providers() -> None:
     spans = e1.get_finished_spans()
     assert len(spans) == 1
     assert spans[0].attributes is not None and spans[0].attributes['genkit:metadata:custom'] == 'val'
+
+
+@pytest.mark.asyncio
+async def test_empty_handshake_url_leaves_trace_ids_empty() -> None:
+    """An empty collector URL on notify/handshake does not turn tracing on."""
+    _handshake_server().apply_handshake_telemetry('')
+    action = Action(name='joke', kind=ActionKind.FLOW, fn=_joke)
+    result = await action.run()
+
+    assert result.trace_id == ''
+    assert result.span_id == ''
+    assert not is_instrumented_by(GenkitBuiltinInstrumentation)
+
+
+@pytest.mark.asyncio
+async def test_second_handshake_does_not_add_another_collector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second notify URL does not stack another Developer UI poster."""
+    monkeypatch.setenv(GENKIT_ENV, 'dev')
+    first = _start_collector()
+    second = _start_collector()
+    first_server, first_posts = first
+    second_server, second_posts = second
+    try:
+        _handshake_server().apply_handshake_telemetry(f'http://127.0.0.1:{first_server.server_address[1]}')
+        _handshake_server().apply_handshake_telemetry(f'http://127.0.0.1:{second_server.server_address[1]}')
+        action = Action(name='joke', kind=ActionKind.FLOW, fn=_joke)
+        result = await action.run()
+        _force_flush()
+
+        builtins = [i for i in instrumentations if isinstance(i, GenkitBuiltinInstrumentation)]
+        assert len(builtins) == 1
+        assert _hex_id(result.trace_id, 32)
+        assert first_posts
+        assert not second_posts
+    finally:
+        first_server.shutdown()
+        second_server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_logger_provider_can_skip_span_ids() -> None:
+    """A provider that only logs can call next() and leave ids empty."""
+
+    class PrintingInstrumentation:
+        async def run_in_new_span(
+            self,
+            metadata: SpanMetadata,
+            next: Callable[..., Awaitable[T]],
+        ) -> T:
+            return await next()
+
+    configure_instrumentation(PrintingInstrumentation())
+    action = Action(name='joke', kind=ActionKind.FLOW, fn=_joke)
+    result = await action.run()
+
+    assert result.response == 'Why did the cat cross the road?'
+    assert result.trace_id == ''
+    assert result.span_id == ''
+
+
+@pytest.mark.asyncio
+async def test_action_context_redacts_auth_and_secrets() -> None:
+    """auth and secrets on action context show up as placeholders on the span."""
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    configure_instrumentation(OtelInstrumentation(tracer_provider=provider))
+
+    action = Action(name='joke', kind=ActionKind.FLOW, fn=_joke)
+    await action.run(context={'auth': 'secret-token', 'secrets': 'shh', 'uid': 'u123'})
+    provider.force_flush()
+
+    span = exporter.get_finished_spans()[0]
+    assert span.attributes is not None
+    context = json.loads(str(span.attributes['genkit:metadata:context']))
+    assert context['auth'] == '<redacted>'
+    assert context['secrets'] == '<redacted>'
+    assert context['uid'] == 'u123'
+
+
+@pytest.mark.asyncio
+async def test_action_context_without_secrets_is_recorded() -> None:
+    """A context with no auth/secrets is written through as-is."""
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    configure_instrumentation(OtelInstrumentation(tracer_provider=provider))
+
+    action = Action(name='joke', kind=ActionKind.FLOW, fn=_joke)
+    await action.run(context={'uid': 'u123'})
+    provider.force_flush()
+
+    span = exporter.get_finished_spans()[0]
+    assert span.attributes is not None
+    context = json.loads(str(span.attributes['genkit:metadata:context']))
+    assert context == {'uid': 'u123'}
+
+
+@pytest.mark.asyncio
+async def test_action_without_context_has_no_context_attribute() -> None:
+    """No action context means the span has no context attribute."""
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    configure_instrumentation(OtelInstrumentation(tracer_provider=provider))
+
+    action = Action(name='joke', kind=ActionKind.FLOW, fn=_joke)
+    await action.run()
+    provider.force_flush()
+
+    span = exporter.get_finished_spans()[0]
+    assert span.attributes is not None
+    assert 'genkit:metadata:context' not in span.attributes
+
+
+@pytest.mark.asyncio
+async def test_uninstrumented_run_action_omits_telemetry_payload() -> None:
+    """v1 runAction omits telemetry when ids are empty so a blank id is not a broken exporter."""
+    from httpx import ASGITransport, AsyncClient
+
+    from genkit._core._reflection import create_reflection_asgi_app
+
+    registry = Registry()
+    action = Action(name='joke', kind=ActionKind.FLOW, fn=_joke)
+    registry.register_action_from_instance(action)
+    app = create_reflection_asgi_app(registry)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url='http://test') as client:
+        response = await client.post('/api/runAction', json={'key': '/flow/joke'})
+    assert response.status_code == 200
+    body = response.json()
+    assert 'telemetry' not in body
+    assert 'X-Genkit-Trace-Id' not in response.headers
+    assert 'X-Genkit-Span-Id' not in response.headers
+
+
+@pytest.mark.asyncio
+async def test_dev_collector_nested_actions_share_trace_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nested actions under genkit start keep one hex trace id."""
+    monkeypatch.setenv(GENKIT_ENV, 'dev')
+    monkeypatch.setenv('GENKIT_TELEMETRY_SERVER', 'http://127.0.0.1:4033')
+    Genkit()
+
+    async def step_fn() -> str:
+        return 'ok'
+
+    step = Action(name='step', kind=ActionKind.UTIL, fn=step_fn)
+
+    async def flow_fn() -> str:
+        inner = await step.run()
+        return inner.response
+
+    flow = Action(name='flow', kind=ActionKind.FLOW, fn=flow_fn)
+    outer = await flow.run()
+    inner = await step.run()
+
+    assert _hex_id(outer.trace_id, 32)
+    assert _hex_id(outer.span_id, 16)
+    assert inner.trace_id != outer.trace_id
+
+
+@pytest.mark.asyncio
+async def test_reset_stops_developer_ui_log_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reset_instrumentation drops the log handler so later logs are not posted."""
+    monkeypatch.setenv(GENKIT_ENV, 'dev')
+    server, posts = _start_collector()
+    monkeypatch.setenv('GENKIT_TELEMETRY_SERVER', f'http://127.0.0.1:{server.server_address[1]}')
+    try:
+        Genkit()
+        assert any(isinstance(i, DirectHttpInstrumentation) for i in instrumentations)
+        reset_instrumentation()
+        import logging
+
+        logging.getLogger('genkit-test').error('after reset')
+        await asyncio.sleep(0.05)
+        assert not any('"after reset"' in body for body in posts)
+    finally:
+        server.shutdown()

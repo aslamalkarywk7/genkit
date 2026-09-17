@@ -19,36 +19,47 @@
 A plain ``Genkit()`` script does not record traces. Action results have
 empty ``trace_id`` and ``span_id``.
 
-Tracing turns on when you call ``configure_instrumentation`` with a
-provider (usually ``OtelInstrumentation``), or when you run under
-``genkit start``. ``genkit start -- python app.py`` sets
-``GENKIT_ENV=dev`` and a collector URL before spawn; ``Genkit()``
-installs ``OtelInstrumentation`` so the Traces tab works. If you start
-the app yourself (``genkit start``, then ``GENKIT_ENV=dev python
-app.py``), the collector URL arrives on ``/api/notify`` or the
-reflection v2 handshake and turns tracing on the same way.
+``genkit start -- python app.py`` sets ``GENKIT_ENV=dev`` and a
+collector URL before spawn; ``Genkit()`` installs an HTTP poster that
+fills the Traces tab without booting OpenTelemetry. If you start the
+app yourself (``genkit start``, then ``GENKIT_ENV=dev python app.py``),
+the collector URL arrives on ``/api/notify`` or the reflection v2
+handshake and turns tracing on the same way.
 
 ``enable_google_cloud_telemetry()`` is enough for Cloud Trace in
-production. Under ``genkit start``, ``Genkit()`` still owns the
-Developer UI collector.
+production. That path uses ``OtelInstrumentation``. Under
+``genkit start``, ``Genkit()`` still owns the Developer UI collector.
 """
 
+from genkit._core._direct_http_instrumentation import (
+    GenkitBuiltinInstrumentation,
+    genkit_dev_instrumentation,
+)
 from genkit._core._instrumentation import (
     configure_instrumentation,
+    dispose_instrumentations,
     is_instrumented_by,
     reset_instrumentation,
     run_in_new_span,
     set_custom_metadata_attributes,
 )
-from genkit._core._instrumentation_api import Instrumentation, SpanContext, SpanMetadata
-from genkit._core._otel_instrumentation import OtelInstrumentation, genkit_dev_instrumentation
+from genkit._core._instrumentation_api import (
+    DisposableInstrumentation,
+    Instrumentation,
+    SpanContext,
+    SpanMetadata,
+)
+from genkit._core._otel_instrumentation import OtelInstrumentation
 
 __all__ = [
+    'DisposableInstrumentation',
+    'GenkitBuiltinInstrumentation',
     'Instrumentation',
     'OtelInstrumentation',
     'SpanContext',
     'SpanMetadata',
     'configure_instrumentation',
+    'dispose_instrumentations',
     'genkit_dev_instrumentation',
     'is_instrumented_by',
     'reset_instrumentation',

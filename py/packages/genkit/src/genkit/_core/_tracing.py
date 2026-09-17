@@ -23,15 +23,15 @@ from ._instrumentation import (
     SpanContext,
     SpanMetadata,
     configure_instrumentation,
+    parent_path_context,
     reset_instrumentation,
     run_in_new_span,
     set_custom_metadata_attributes,
+    start_attributes,
 )
 from ._otel_instrumentation import (
     add_custom_exporter,
     init_provider,
-    parent_path_context,
-    start_attributes,
     tracer,
 )
 

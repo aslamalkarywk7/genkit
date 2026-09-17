@@ -38,11 +38,11 @@ from starlette.routing import Route
 
 from genkit._core._action import Action, BidiAction
 from genkit._core._constants import GENKIT_VERSION
+from genkit._core._direct_http_instrumentation import connect_developer_ui_collector
 from genkit._core._error import get_reflection_json
 from genkit._core._logger import get_logger
 from genkit._core._middleware import GenerateMiddleware
 from genkit._core._model import ModelRef
-from genkit._core._otel_instrumentation import connect_developer_ui_collector
 from genkit._core._registry import Registry
 from genkit._core._typing import AgentInit, AgentInput
 
@@ -155,12 +155,10 @@ class ActionRunner:
                 if isinstance(output.response, BaseModel)
                 else output.response
             )
-            self.queue.put_nowait(
-                json.dumps({
-                    'result': result,
-                    'telemetry': {'traceId': output.trace_id, 'spanId': output.span_id},
-                })
-            )
+            payload: dict[str, Any] = {'result': result}
+            if output.trace_id:
+                payload['telemetry'] = {'traceId': output.trace_id, 'spanId': output.span_id}
+            self.queue.put_nowait(json.dumps(payload))
         except asyncio.CancelledError:
             raise
         except Exception as e:

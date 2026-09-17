@@ -20,11 +20,20 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import json
 from collections.abc import Awaitable, Callable, Mapping
 from contextvars import ContextVar
-from typing import TypeVar
+from typing import Any, TypeVar
 
-from ._instrumentation_api import Instrumentation, SpanContext, SpanMetadata
+from pydantic import BaseModel
+
+from ._instrumentation_api import (
+    DisposableInstrumentation,
+    Instrumentation,
+    SpanContext,
+    SpanMetadata,
+)
+from ._trace._attrs import Attr, metadata_key
 
 T = TypeVar('T')
 
@@ -32,6 +41,7 @@ instrumentations: list[Instrumentation] = []
 
 # Active SpanContext so set_custom_metadata_attributes can reach it.
 current_span: ContextVar[SpanContext | None] = ContextVar('genkit_span_context', default=None)
+parent_path_context: ContextVar[str] = ContextVar('genkit_parent_path', default='')
 
 
 def describe_value(value: object) -> str:
@@ -42,11 +52,58 @@ def describe_value(value: object) -> str:
     return f'{cls.__module__}.{cls.__qualname__}'
 
 
+def to_json_attr(value: object) -> str:
+    """Serialize an arbitrary object for an input/output span attribute."""
+    if isinstance(value, BaseModel):
+        return value.model_dump_json(by_alias=True, exclude_none=True)
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def start_attributes(
+    metadata: SpanMetadata,
+    *,
+    qualified_path: str,
+) -> dict[str, Any]:
+    """Attrs known when the span begins (identity/shape + input).
+
+    Live-trace export snapshots the span the instant it starts, so these have to
+    be on the span *before* start returns; otherwise Dev UI shows a blank
+    in-progress entry until the span ends. State/output stay out — they aren't
+    known until the body finishes.
+    """
+    attrs: dict[str, Any] = {}
+    if metadata.attributes:
+        attrs.update(metadata.attributes)
+    attrs.update({
+        Attr.NAME: metadata.name,
+        Attr.PATH: qualified_path,
+        Attr.QUALIFIED_PATH: qualified_path,
+    })
+    if metadata.action_type:
+        attrs[Attr.TYPE] = metadata.action_type
+    if metadata.subtype:
+        attrs[Attr.SUBTYPE] = metadata.subtype
+    if metadata.is_root:
+        attrs[Attr.IS_ROOT] = True
+    if metadata.metadata:
+        for meta_key, meta_value in metadata.metadata.items():
+            attrs[metadata_key(meta_key)] = str(meta_value)
+    if metadata.input is not None:
+        attrs[Attr.INPUT] = to_json_attr(metadata.input)
+    if metadata.init is not None:
+        attrs[Attr.INIT] = to_json_attr(metadata.init)
+    return attrs
+
+
 def configure_instrumentation(instrumentation: Instrumentation) -> None:
     """Turn on a telemetry backend. Call before ``Genkit()`` to stack backends.
 
-    Each provider wraps the next. ``OtelInstrumentation`` is the built-in.
-    ``genkit start`` installs that one when a collector is configured.
+    Each provider wraps the next. ``genkit start`` installs the Developer UI
+    HTTP poster when a collector URL is set. Cloud Trace still needs
+    ``OtelInstrumentation`` (or ``enable_google_cloud_telemetry()``).
     """
     # The class itself has run_in_new_span, so a forgotten () would pass a
     # Protocol check and then die inside OTel on the first span.
@@ -57,19 +114,25 @@ def configure_instrumentation(instrumentation: Instrumentation) -> None:
     instrumentations.append(instrumentation)
 
 
+def dispose_instrumentations() -> None:
+    """Release provider resources. Safe to call more than once."""
+    for inst in instrumentations:
+        if isinstance(inst, DisposableInstrumentation):
+            inst.dispose()
+
+
 def reset_instrumentation() -> None:
     """Remove all providers. Tests and re-init."""
+    dispose_instrumentations()
     instrumentations.clear()
-    from ._otel_instrumentation import reset_developer_ui_collector
-
-    reset_developer_ui_collector()
 
 
 def is_instrumented_by(kind: type) -> bool:
     """True when a configured provider is an instance of ``kind``.
 
-    Use ``is_instrumented_by(OtelInstrumentation)`` to see whether Genkit
-    is already minting OpenTelemetry spans.
+    Use ``is_instrumented_by(OtelInstrumentation)`` for Cloud Trace, or
+    ``is_instrumented_by(GenkitBuiltinInstrumentation)`` for the Developer
+    UI poster.
     """
     if not isinstance(kind, type):
         raise TypeError('is_instrumented_by expected a type, got ' + describe_value(kind))
@@ -124,8 +187,9 @@ async def run_in_new_span(
         if index == len(providers):
             return await _run_with_span(CompositeSpanContext(spans), fn)
 
-        async def nxt(span: SpanContext) -> T:
-            spans.append(span)
+        async def nxt(span: SpanContext | None = None) -> T:
+            if span is not None:
+                spans.append(span)
             return await build(index + 1)
 
         return await providers[index].run_in_new_span(meta, nxt)

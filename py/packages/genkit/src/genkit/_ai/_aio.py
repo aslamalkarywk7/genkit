@@ -102,9 +102,10 @@ from genkit._core._dap import (
     DynamicActionProvider,
     define_dynamic_action_provider as define_dap_block,
 )
+from genkit._core._direct_http_instrumentation import maybe_inject_dev_instrumentation
 from genkit._core._environment import is_dev_environment
 from genkit._core._error import GenkitError
-from genkit._core._instrumentation import configure_instrumentation, run_in_new_span
+from genkit._core._instrumentation import run_in_new_span
 from genkit._core._logger import configure_logging, get_logger, resolve_level
 from genkit._core._middleware import (
     BaseMiddleware,
@@ -112,7 +113,6 @@ from genkit._core._middleware import (
     _validate_middleware_key_segment,
 )
 from genkit._core._model import Document, ModelConfigDict, ModelRef, ModelRefConfigT
-from genkit._core._otel_instrumentation import genkit_dev_instrumentation
 from genkit._core._plugin import Plugin
 from genkit._core._protocols import SessionLike
 from genkit._core._reflection import ReflectionServer, ServerSpec, create_reflection_asgi_app
@@ -188,10 +188,7 @@ class Genkit:
         # Ensure the default generate action is registered for async usage.
         define_generate_action(self.registry)
         self._register_plugin_middleware(plugins)
-        if is_dev_environment():
-            dev_instrumentation = genkit_dev_instrumentation()
-            if dev_instrumentation is not None:
-                configure_instrumentation(dev_instrumentation)
+        maybe_inject_dev_instrumentation()
         # In dev mode, start the reflection server immediately in a background
         # daemon thread so it's available regardless of which web framework (or
         # none) the user chooses.

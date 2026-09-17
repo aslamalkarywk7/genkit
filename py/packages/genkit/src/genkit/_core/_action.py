@@ -58,6 +58,20 @@ def _record_latency(output: object, latency_ms: float) -> object:
     return output
 
 
+REDACTED_CONTEXT_KEYS = frozenset({'auth', 'secrets'})
+
+
+def _context_for_span(context: object) -> object:
+    """Shallow-copy a context mapping and replace auth / secrets."""
+    if not isinstance(context, dict):
+        return context
+    traced = dict(context)
+    for key in REDACTED_CONTEXT_KEYS:
+        if key in traced:
+            traced[key] = '<redacted>'
+    return traced
+
+
 def _sanitize_value(val: object, seen: set[int] | None = None) -> object:
     """Recursively filter out dictionary keys or list items that cannot be serialized to JSON."""
     if seen is None:
@@ -753,15 +767,15 @@ class Action(Generic[InputT, OutputT, ChunkT, InitT]):
         # ``self._span_metadata`` uses short keys; run_in_new_span auto-prefixes them with
         # ``genkit:metadata:``. ``telemetry_labels`` are caller-controlled passthrough attrs.
         extra_metadata: dict[str, str] = {k: str(v) for k, v in self._span_metadata.items()}
-        # Surface action context (auth, headers, etc.) on the span so the Dev UI
-        # trace inspector can render the "Context" panel for a flow run.
+        # The Dev UI Context panel shows this dict. auth / secrets are what
+        # the caller handed the action for the model or tools — write
+        # placeholders so a shared trace dump does not leak them.
         if ctx.context:
             try:
-                extra_metadata['context'] = json.dumps(ctx.context)
+                extra_metadata['context'] = json.dumps(_context_for_span(ctx.context))
             except Exception:
                 try:
-                    cleaned_context = _sanitize_value(ctx.context)
-                    extra_metadata['context'] = json.dumps(cleaned_context)
+                    extra_metadata['context'] = json.dumps(_context_for_span(_sanitize_value(ctx.context)))
                 except Exception:
                     extra_metadata['context'] = str(ctx.context)
 
