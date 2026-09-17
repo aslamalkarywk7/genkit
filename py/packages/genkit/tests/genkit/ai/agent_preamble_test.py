@@ -39,7 +39,7 @@ from genkit._core._typing import (
     ToolResponse,
     ToolResponsePart,
 )
-from genkit.agent import AgentError, InMemorySessionStore
+from genkit.agent import InMemorySessionStore
 
 
 def test_tag_history_for_render_copies_messages() -> None:
@@ -322,8 +322,8 @@ async def test_prompt_agent_tool_messages_preserved_verbatim() -> None:
 
 
 @pytest.mark.asyncio
-async def test_prompt_agent_schema_miss_keeps_invalid_argument() -> None:
-    """An invalid Recipe is a failed turn with the generate() status, not UNKNOWN."""
+async def test_prompt_agent_schema_miss_keeps_the_model_text() -> None:
+    """Bad JSON is not a dead turn: send() returns the model text like generate()."""
 
     class Recipe(BaseModel):
         title: str
@@ -339,9 +339,9 @@ async def test_prompt_agent_schema_miss_keeps_invalid_argument() -> None:
         )
     )
 
-    with pytest.raises(AgentError) as raised:
-        await agent.chat().send('give me a recipe')
-    assert raised.value.status == 'INTERNAL'
+    out = await agent.chat().send('give me a recipe')
+    assert out.finish_reason == AgentFinishReason.STOP
+    assert out.text == 'not json'
 
 
 @pytest.mark.asyncio

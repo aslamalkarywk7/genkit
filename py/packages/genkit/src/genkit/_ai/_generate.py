@@ -66,7 +66,7 @@ from genkit._core._background import (
     missing_operation_error,
     stamp_operation_action,
 )
-from genkit._core._error import GenkitError, GenkitRuntimeError, RuntimeErrorReason
+from genkit._core._error import GenkitError, GenkitRuntimeError, PublicError, RuntimeErrorReason
 from genkit._core._logger import get_logger, is_debug_enabled
 from genkit._core._middleware import (
     BaseMiddleware,
@@ -944,8 +944,19 @@ class GenerateRun:
         self.messages = list(messages)
 
     def remember(self, result: ModelResponse) -> None:
+        # after_result runs once per hook. A later hook that rewrites this
+        # turn replaces that message so history is not two model turns in a row.
+        if (
+            result.message is not None
+            and self.last_response is not None
+            and self.last_response.message is not None
+            and self.messages
+            and self.messages[-1] == self.last_response.message
+        ):
+            self.messages = [*self.messages[:-1], result.message]
+        else:
+            self.messages = history_with_closed_turn(messages=self.messages, result=result)
         self.last_response = result
-        self.messages = history_with_closed_turn(messages=self.messages, result=result)
 
 
 def history_with_closed_turn(*, messages: list[Message], result: ModelResponse) -> list[Message]:
@@ -1007,6 +1018,41 @@ def box_dead_turn(
     return attach_resendable_history(out, messages)
 
 
+INTERNAL_FINISH_MESSAGE = 'internal error'
+
+
+def public_error(exc: BaseException) -> PublicError | None:
+    if isinstance(exc, PublicError):
+        return exc
+    if isinstance(exc, GenkitError) and isinstance(exc.cause, PublicError):
+        return exc.cause
+    return None
+
+
+def boxed_finish_message(*, exc: BaseException, pipe_failed: bool) -> str:
+    # The string on a returned response is what a flow can put in a 200.
+    # PublicError is how a tool author publishes that sentence.
+    if pipe_failed:
+        if isinstance(exc, GenkitError):
+            return exc.original_message or type(exc).__name__
+        return str(exc) or type(exc).__name__
+    published = public_error(exc)
+    if published is not None:
+        return published.original_message or INTERNAL_FINISH_MESSAGE
+    if isinstance(exc, GenkitError) and (
+        exc.cause is None or isinstance(exc.cause, GenkitError) or exc.status != 'INTERNAL'
+    ):
+        return exc.original_message or INTERNAL_FINISH_MESSAGE
+    return INTERNAL_FINISH_MESSAGE
+
+
+def raise_if_foreign_cancel(*, exc: BaseException, abort_signal: asyncio.Event) -> None:
+    # abort_signal is our own stop. A wait_for / task.cancel() has to
+    # surface as CancelledError so the deadline still works.
+    if isinstance(exc, asyncio.CancelledError) and not abort_signal.is_set():
+        raise
+
+
 def box_from_exc(
     *,
     response: ModelResponse,
@@ -1024,18 +1070,7 @@ def box_from_exc(
         exc = callback_cause
         reason = None
         pipe_failed = True
-    if isinstance(exc, GenkitError):
-        # str(GenkitError) prefixes STATUS:. The finish_message they read
-        # is the wrapper's wording plus the cause they actually hit.
-        finish_message = exc.original_message or ''
-        if exc.cause is not None:
-            cause_text = str(exc.cause)
-            if cause_text and cause_text not in finish_message:
-                finish_message = f'{finish_message}: {cause_text}' if finish_message else cause_text
-        if not finish_message:
-            finish_message = type(exc).__name__
-    else:
-        finish_message = str(exc) or type(exc).__name__
+    finish_message = boxed_finish_message(exc=exc, pipe_failed=pipe_failed)
     if caller_stopped:
         finish_message = 'Generation aborted.'
         status = 'CANCELLED'
@@ -1234,11 +1269,12 @@ async def run_wrap_generate(
             name=resolved.model.name,
         )
     except (Exception, asyncio.CancelledError) as exc:
+        raise_if_foreign_cancel(exc=exc, abort_signal=ctx.abort_signal)
         return box_from_exc(
             response=call.last_response if call.last_response is not None else ModelResponse(),
             messages=call.messages,
             exc=exc,
-            caller_stopped=ctx.abort_signal.is_set() or isinstance(exc, asyncio.CancelledError),
+            caller_stopped=ctx.abort_signal.is_set(),
         )
     dropped = (
         box_if_hook_dropped_ticket(
@@ -1314,11 +1350,12 @@ async def generate_turn(
             current_turn=current_turn,
         )
     except (Exception, asyncio.CancelledError) as exc:
+        raise_if_foreign_cancel(exc=exc, abort_signal=ctx.abort_signal)
         return box_from_exc(
             response=call.ticket if call.ticket is not None else ModelResponse(),
             messages=call.messages,
             exc=exc,
-            caller_stopped=ctx.abort_signal.is_set() or isinstance(exc, asyncio.CancelledError),
+            caller_stopped=ctx.abort_signal.is_set(),
         )
     dropped = (
         box_if_hook_dropped_ticket(
@@ -1572,11 +1609,12 @@ async def run_tools_or_stop(
             tools=resolved.tools,
         )
     except (Exception, asyncio.CancelledError) as exc:
+        raise_if_foreign_cancel(exc=exc, abort_signal=ctx.abort_signal)
         return box_from_exc(
             response=response,
             messages=list(options.messages),
             exc=exc,
-            caller_stopped=ctx.abort_signal.is_set() or isinstance(exc, asyncio.CancelledError),
+            caller_stopped=ctx.abort_signal.is_set(),
             reason=RuntimeErrorReason.TOOL_FAILED,
         )
 

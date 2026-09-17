@@ -500,7 +500,7 @@ def _register_prompt_action_pair(
     async def prompt_action_fn(input: Any = None) -> ModelRequest:  # noqa: ANN401
         ep = await ep_factory()
         registry, options = await prepare_prompt(prompt=ep, input=input, opts={})
-        return await to_model_request(registry=registry, options=options)
+        return await to_prompt_model_request(registry=registry, options=options)
 
     async def executable_prompt_action_fn(input: Any = None) -> GenerateActionOptions:  # noqa: ANN401
         ep = await ep_factory()
@@ -712,7 +712,7 @@ def coerce_prompt_template_input(template_input: Any) -> dict[str, Any]:  # noqa
     return cast(dict[str, Any], template_input)
 
 
-async def to_model_request(*, registry: Registry, options: GenerateActionOptions) -> ModelRequest:
+async def to_prompt_model_request(*, registry: Registry, options: GenerateActionOptions) -> ModelRequest:
     """Convert GenerateActionOptions to ModelRequest, resolving tool names."""
     tools = await resolve_tools_from_options(registry, options.tools)
     tool_defs = [to_tool_definition(tool) for tool in tools] if tools else []

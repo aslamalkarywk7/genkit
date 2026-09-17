@@ -86,7 +86,7 @@ async def lookup_resource_by_name(registry: Registry, name: str) -> Action:
     )
     if not resource:
         raise GenkitError(
-            status='INVALID_ARGUMENT',
+            status='NOT_FOUND',
             message=f'Resource {name} not found',
             reason=RuntimeErrorReason.INVALID_INPUT,
         )

@@ -27,7 +27,7 @@ from genkit._ai._testing import (
 )
 from genkit._ai._tools import Interrupt, ToolRunContext, define_tool, restart_tool
 from genkit._core._action import ActionRunContext
-from genkit._core._error import GenkitError, RuntimeErrorReason
+from genkit._core._error import GenkitError, PublicError, RuntimeErrorReason
 from genkit._core._model import GenerateActionOptions, ModelRequest
 from genkit._core._registry import Registry
 from genkit._core._typing import (
@@ -3623,9 +3623,7 @@ async def test_tool_failure_after_tool_turn_keeps_closed_rounds() -> None:
 
     response = await ai.generate(prompt='keep going', tools=['lookup'])
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message is not None
-    assert 'lookup' in response.finish_message
-    assert 'db down' in response.finish_message
+    assert response.finish_message == 'internal error'
     assert response.error is not None
     assert response.error.status == 'INTERNAL'
     assert response.error.reason is RuntimeErrorReason.TOOL_FAILED
@@ -3635,6 +3633,51 @@ async def test_tool_failure_after_tool_turn_keeps_closed_rounds() -> None:
     assert response.message is None
     assert [m.role for m in response.messages] == [Role.USER, Role.MODEL, Role.TOOL]
     assert _tool_output(response.messages[2]) == '72F'
+
+
+@pytest.mark.asyncio
+async def test_tool_runtime_error_message_is_internal() -> None:
+    """A tool RuntimeError does not publish its text on the returned response."""
+    ai = Genkit(model='programmableModel')
+    pm, _ = define_programmable_model(ai)
+
+    @ai.tool(name='lookup')
+    async def lookup() -> str:
+        raise RuntimeError('connection to postgres://user:pw@host refused')
+
+    pm.responses = [_model_calls_tool(name='lookup', ref='r1')]
+
+    response = await ai.generate(prompt='hi', tools=['lookup'])
+    assert response.finish_reason == FinishReason.FAILED
+    assert response.finish_message == 'internal error'
+    assert response.error is not None
+    assert response.error.message == 'internal error'
+    assert 'postgres' not in (response.finish_message or '')
+    assert response.message is None
+    assert [m.role for m in response.messages] == [Role.USER]
+
+
+@pytest.mark.asyncio
+async def test_tool_public_error_message_is_the_sentence() -> None:
+    """PublicError is how the tool author publishes the sentence on the response."""
+    ai = Genkit(model='programmableModel')
+    pm, _ = define_programmable_model(ai)
+
+    @ai.tool(name='lookup_order')
+    async def lookup_order() -> str:
+        raise PublicError('NOT_FOUND', 'No order 99')
+
+    pm.responses = [_model_calls_tool(name='lookup_order', ref='r1')]
+
+    response = await ai.generate(prompt='hi', tools=['lookup_order'])
+    assert response.finish_reason == FinishReason.FAILED
+    assert response.finish_message == 'No order 99'
+    assert response.error is not None
+    assert response.error.status == 'NOT_FOUND'
+    assert response.error.message == 'No order 99'
+    assert response.error.reason is RuntimeErrorReason.TOOL_FAILED
+    assert response.message is None
+    assert [m.role for m in response.messages] == [Role.USER]
 
 
 @pytest.mark.asyncio
@@ -3660,8 +3703,7 @@ async def test_output_schema_does_not_replace_tool_failure() -> None:
     )
 
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message is not None
-    assert 'db down' in response.finish_message
+    assert response.finish_message == 'internal error'
     assert response.message is None
     assert response.output is None
     assert response.error is not None
@@ -3747,8 +3789,7 @@ async def test_sibling_interrupt_goes_with_failed_tool_round() -> None:
     response = await ai.generate(prompt='start', tools=['pauser', 'boom'])
 
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message is not None
-    assert 'boom' in response.finish_message
+    assert response.finish_message == 'internal error'
     assert response.message is None
     assert response.interrupts == []
     assert response.error is not None
@@ -3773,8 +3814,7 @@ async def test_first_turn_model_failure_returns_closed_history() -> None:
     response = await ai.generate(prompt='start')
 
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message is not None
-    assert 'model exploded' in response.finish_message
+    assert response.finish_message == 'internal error'
     assert response.message is None
     assert response.error is not None
     assert response.error.status == 'INTERNAL'
@@ -3806,9 +3846,7 @@ async def test_model_failure_after_tool_turn_keeps_closed_rounds() -> None:
 
     response = await ai.generate(prompt='keep going', tools=['lookup'])
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message is not None
-    assert 'programmableModel' in response.finish_message
-    assert 'stream died' in response.finish_message
+    assert response.finish_message == 'internal error'
     assert response.error is not None
     assert response.error.status == 'INTERNAL'
     assert response.error.reason is None
@@ -4133,8 +4171,7 @@ async def test_midstream_model_failure_keeps_chunks_and_prior_closed_history() -
     assert [text_from_content(chunk.content) for chunk in model_chunks] == ['partial-1', 'partial-2']
     assert [chunk.role for chunk in chunks] == [Role.TOOL, Role.MODEL, Role.MODEL]
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message is not None
-    assert 'stream broke' in response.finish_message
+    assert response.finish_message == 'internal error'
     assert response.message is None
     assert response.error is not None
     assert response.error.status == 'INTERNAL'
@@ -4164,8 +4201,7 @@ async def test_first_turn_midstream_failure_keeps_chunks_and_drops_unfinished_me
 
     assert [text_from_content(chunk.content) for chunk in chunks] == ['Hello, ', 'wor']
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message is not None
-    assert 'stream died' in response.finish_message
+    assert response.finish_message == 'internal error'
     assert response.message is None
     assert response.error is not None
     assert response.error.status == 'INTERNAL'
@@ -4260,7 +4296,8 @@ async def test_generate_on_chunk_genkit_error_is_internal_not_the_sink_reason() 
 
 
 @pytest.mark.asyncio
-async def test_first_turn_task_cancellation_returns_structured_response() -> None:
+async def test_first_turn_task_cancel_raises() -> None:
+    """Cancelling the generate task raises CancelledError; it does not return a response."""
     ai = Genkit(model='waitingModel')
     started = asyncio.Event()
     model_calls = 0
@@ -4276,24 +4313,28 @@ async def test_first_turn_task_cancellation_returns_structured_response() -> Non
     task = asyncio.create_task(ai.generate(prompt='wait'))
     await started.wait()
     task.cancel()
-    response = await task
-
-    assert response.finish_reason == FinishReason.ABORTED
-    assert response.finish_message == 'Generation aborted.'
-    assert response.message is None
-    assert response.error is not None
-    assert response.error.status == 'CANCELLED'
-    assert response.error.reason is None
-    assert response.error.details is None
-    assert response.error.message == response.finish_message
-    assert [message.role for message in response.messages] == [Role.USER]
-    assert response.messages[0].text == 'wait'
+    with pytest.raises(asyncio.CancelledError):
+        await task
     assert model_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_task_cancel_after_tool_turn_keeps_closed_rounds() -> None:
-    """Cancelling after a tool returns keeps the closed round."""
+async def test_wait_for_generate_raises_timeout() -> None:
+    """asyncio.wait_for around generate still raises TimeoutError."""
+    ai = Genkit(model='slow')
+
+    async def slow_model(_request: ModelRequest, _ctx: ActionRunContext) -> ModelResponse:
+        await asyncio.sleep(5)
+        raise AssertionError('unreachable')
+
+    ai.define_model(name='slow', fn=slow_model)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(ai.generate(model='slow', prompt='x'), timeout=0.3)
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_after_tool_turn_raises() -> None:
+    """Cancelling the generate task after a closed tool round still raises CancelledError."""
     ai = Genkit(model='cancelAfterToolModel')
     second_started = asyncio.Event()
     model_calls = 0
@@ -4315,19 +4356,8 @@ async def test_task_cancel_after_tool_turn_keeps_closed_rounds() -> None:
     task = asyncio.create_task(ai.generate(prompt='keep going', tools=['lookup']))
     await second_started.wait()
     task.cancel()
-    response = await task
-
-    assert response.finish_reason == FinishReason.ABORTED
-    assert response.finish_message == 'Generation aborted.'
-    assert response.message is None
-    assert response.error is not None
-    assert response.error.status == 'CANCELLED'
-    assert response.error.reason is None
-    assert response.error.details is None
-    assert response.error.message == response.finish_message
-    assert [message.role for message in response.messages] == [Role.USER, Role.MODEL, Role.TOOL]
-    assert response.messages[1].tool_requests[0].tool_request.ref == 'r1'
-    assert _tool_output(response.messages[2]) == '72F'
+    with pytest.raises(asyncio.CancelledError):
+        await task
     assert model_calls == 2
 
 
@@ -4373,9 +4403,7 @@ async def test_recovered_middleware_failure_uses_latest_closed_history() -> None
     response = await ai.generate(prompt='start', tools=['lookup'], use=[RecoverOnce()])
 
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message is not None
-    assert 'later failure' in response.finish_message
-    assert 'transient failure' not in response.finish_message
+    assert response.finish_message == 'internal error'
     assert response.message is None
     assert response.error is not None
     assert response.error.status == 'INTERNAL'
@@ -4532,7 +4560,7 @@ async def test_generate_middleware_failure_keeps_closed_rounds() -> None:
 
     response = await ai.generate(prompt='keep going', tools=['lookup'], use=[DenySecondTurn()])
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message == 'hook denied'
+    assert response.finish_message == 'internal error'
     assert response.error is not None
     assert response.error.status == 'INTERNAL'
     assert response.error.reason is None
@@ -4541,6 +4569,50 @@ async def test_generate_middleware_failure_keeps_closed_rounds() -> None:
     assert response.message is None
     assert [m.role for m in response.messages] == [Role.USER, Role.MODEL, Role.TOOL]
     assert _tool_output(response.messages[2]) == '72F'
+
+
+@pytest.mark.asyncio
+async def test_middleware_rewrite_then_raise_keeps_one_model_turn() -> None:
+    """A later wrap_generate that raises after an inner rewrite keeps one model message."""
+    ai = Genkit(model='programmableModel')
+    pm, _ = define_programmable_model(ai)
+    pm.responses = [_model_says('secret')]
+
+    class Config(BaseModel):
+        pass
+
+    @ai.middleware(name='redact')
+    class Redact(BaseMiddleware[Config]):
+        async def wrap_generate(
+            self,
+            params: GenerateHookParams,
+            ctx: GenerateMiddlewareContext,
+            next_fn: Callable[[GenerateHookParams, GenerateMiddlewareContext], Awaitable[ModelResponse]],
+        ) -> ModelResponse:
+            result = await next_fn(params, ctx)
+            return result.model_copy(
+                update={
+                    'message': Message(role=Role.MODEL, content=[Part(root=TextPart(text='REDACTED'))]),
+                }
+            )
+
+    @ai.middleware(name='outer_boom')
+    class OuterBoom(BaseMiddleware[Config]):
+        async def wrap_generate(
+            self,
+            params: GenerateHookParams,
+            ctx: GenerateMiddlewareContext,
+            next_fn: Callable[[GenerateHookParams, GenerateMiddlewareContext], Awaitable[ModelResponse]],
+        ) -> ModelResponse:
+            await next_fn(params, ctx)
+            raise RuntimeError('outer failed')
+
+    response = await ai.generate(prompt='hi', use=[OuterBoom(), Redact()])
+    assert response.finish_reason == FinishReason.FAILED
+    assert response.finish_message == 'internal error'
+    assert response.message is None
+    assert [m.role for m in response.messages] == [Role.USER, Role.MODEL]
+    assert response.messages[1].text == 'REDACTED'
 
 
 @pytest.mark.asyncio
@@ -4652,8 +4724,7 @@ async def test_generate_first_turn_middleware_runtime_error_drops_unanswered_mod
 
     response = await ai.generate(prompt='start', use=[DenyFirstTurn()])
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message is not None
-    assert 'hook denied' in response.finish_message
+    assert response.finish_message == 'internal error'
     assert response.error is not None
     assert response.error.status == 'INTERNAL'
     assert response.message is None
@@ -4783,8 +4854,7 @@ async def test_generate_middleware_validation_error_after_next_fn_keeps_model_tu
 
     response = await ai.generate(prompt='keep going', use=[DenyAfterModel()])
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message is not None
-    assert 'title' in response.finish_message
+    assert response.finish_message == 'internal error'
     assert response.error is not None
     assert response.error.status == 'INTERNAL'
     assert response.error.reason is None
@@ -4832,8 +4902,7 @@ async def test_generate_middleware_validation_error_after_next_fn_keeps_closed_r
 
     response = await ai.generate(prompt='keep going', tools=['lookup'], use=[DenyAfterNextFn()])
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message is not None
-    assert 'title' in response.finish_message
+    assert response.finish_message == 'internal error'
     assert response.error is not None
     assert response.error.status == 'INTERNAL'
     assert response.error.reason is None
@@ -5527,8 +5596,7 @@ async def test_generate_wrap_model_runtime_error_before_next_fn_drops_unanswered
 
     response = await ai.generate(prompt='keep going', use=[BoomBeforeModel()])
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message is not None
-    assert 'boom' in response.finish_message
+    assert response.finish_message == 'internal error'
     assert response.error is not None
     assert response.error.status == 'INTERNAL'
     assert response.message is None
@@ -5652,7 +5720,7 @@ async def test_generate_middleware_interrupt_after_next_fn_keeps_model_turn() ->
 
     response = await ai.generate(prompt='keep going', use=[InterruptAfterModel()])
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message == 'Interrupt'
+    assert response.finish_message == 'internal error'
     assert response.error is not None
     assert response.error.status == 'INTERNAL'
     assert response.error.reason is None
@@ -5696,7 +5764,7 @@ async def test_generate_middleware_interrupt_after_next_fn_keeps_closed_rounds()
 
     response = await ai.generate(prompt='keep going', tools=['lookup'], use=[InterruptAfterNextFn()])
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message == 'Interrupt'
+    assert response.finish_message == 'internal error'
     assert response.error is not None
     assert response.error.status == 'INTERNAL'
     assert response.error.reason is None
@@ -5890,7 +5958,7 @@ async def test_generate_middleware_dropping_failure_still_keeps_closed_rounds() 
 
     response = await ai.generate(prompt='keep going', tools=['lookup'], use=[DropFailureResponse()])
     assert response.finish_reason == FinishReason.FAILED
-    assert response.finish_message == 'hook discarded failure'
+    assert response.finish_message == 'internal error'
     assert response.error is not None
     assert response.error.status == 'INTERNAL'
     assert response.error.reason is None
@@ -6143,8 +6211,8 @@ async def test_generate_array_with_object_schema_raises_invalid_schema() -> None
 
 
 @pytest.mark.asyncio
-async def test_generate_unknown_resource_name_raises_invalid_input() -> None:
-    """A resource name that is not registered is a bad argument."""
+async def test_generate_unknown_resource_name_raises_not_found() -> None:
+    """A resource name that is not registered is NOT_FOUND, same as an unmatched URI."""
     ai = Genkit(model='programmableModel')
     define_programmable_model(ai)
 
@@ -6163,7 +6231,7 @@ async def test_generate_unknown_resource_name_raises_invalid_input() -> None:
             ),
         )
     error = raised.value
-    assert error.status == 'INVALID_ARGUMENT'
+    assert error.status == 'NOT_FOUND'
     assert error.reason is RuntimeErrorReason.INVALID_INPUT
     assert 'ghost' in error.original_message
     assert 'INVALID_INPUT' not in error.original_message

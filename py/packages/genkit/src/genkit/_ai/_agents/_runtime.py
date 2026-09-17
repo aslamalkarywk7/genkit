@@ -1066,7 +1066,8 @@ async def generate_prompt_agent_turn(
         response=response,
     )
 
-    if response.error is not None:
+    # Bad JSON is not a dead turn — generate already kept the model text.
+    if response.error is not None and response.error.reason is not RuntimeErrorReason.INVALID_OUTPUT:
         raise GenkitError(
             message=response.error.message,
             status=cast(Any, response.error.status),

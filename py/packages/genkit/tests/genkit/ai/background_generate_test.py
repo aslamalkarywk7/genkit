@@ -493,8 +493,7 @@ async def test_generate_operation_raises_the_boxed_error_when_start_never_ran(ai
     boxed = await ai.generate(model='bg-model', prompt='a cat', use=[DenyStart()])
     assert boxed.error is not None
     assert boxed.operation is None
-    assert boxed.finish_message is not None
-    assert 'nope' in boxed.finish_message
+    assert boxed.finish_message == 'internal error'
 
     with pytest.raises(GenkitError) as ei:
         await ai.generate_operation(model='bg-model', prompt='a cat', use=[DenyStart()])
