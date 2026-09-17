@@ -58,6 +58,7 @@ import {
 } from './agent-types.js';
 import {
   GenerateResponse,
+  GenerationAbortedError,
   GenerationResponseError,
   generateStream,
 } from './generate.js';
@@ -276,6 +277,21 @@ interface AgentErrorDetails {
   status: string;
   message: string;
   details?: any;
+}
+
+/**
+ * The error a prompt-backed agent hands the runner for a generation the loop
+ * reported on the response (see `throwOnError`): the classification the loop
+ * would have thrown, so the runner reads the failure's status, text and
+ * details, and tells a caller's stop from a break by the error's identity.
+ */
+function generationError(res: GenerateResponse): GenerationResponseError {
+  const { status, message } = res.error!;
+  const Ctor =
+    res.finishReason === 'aborted'
+      ? GenerationAbortedError
+      : GenerationResponseError;
+  return new Ctor(res, message, status as GenkitError['status']);
 }
 
 /**
@@ -1875,7 +1891,15 @@ export function definePromptAgent<
         };
       }
 
-      const result = generateStream(registry, { ...genOpts, abortSignal });
+      // Failures come back on the response: the loop's classification of
+      // what broke or what stopped it, over the conversation it completed. A
+      // failure before the request resolved (a render or validation failure)
+      // still throws, and rolls the turn back.
+      const result = generateStream(registry, {
+        ...genOpts,
+        abortSignal,
+        throwOnError: false,
+      });
 
       // Keep everything that is NOT a prompt-template message:
       //   • history messages (clean - history tag was stripped before generate)
@@ -1884,39 +1908,28 @@ export function definePromptAgent<
       const turnSessionMessages = (messages: MessageData[]) =>
         messages.filter((m) => !m.metadata?.[promptTag]);
 
-      let res: GenerateResponse;
-      try {
-        for await (const chunk of result.stream) {
-          sendChunk({ modelChunk: chunk });
-        }
-        res = await result.response;
-      } catch (e) {
-        const partial =
-          e instanceof GenerationResponseError ? e.detail.response : undefined;
-        if (partial?.request && partial.finishReason === 'interrupted') {
-          // An interrupt is a turn outcome, not a failure, even when it
-          // arrives as one. `generate` reports a restarted tool that
-          // interrupted again with a FAILED_PRECONDITION, because its caller
-          // asked for a completed generation; the agent's caller did not. The
-          // tip that comes back is the same answerable interrupt a first-run
-          // interrupt leaves, and only `resume` can answer either, so the turn
-          // takes the success path and commits the same way both times.
-          res = partial;
-        } else if (partial?.request) {
-          // The partial's history ends at a turn seam (see `generate`), so it
-          // is a conversation the caller can continue. Fold it into the
-          // session and commit the turn as a resume point: a
-          // CommittedTurnError is what says so (see SessionRunner.run). The
-          // turn records `failed`, not the partial's own finish reason: a
-          // response the loop completed and post-processing then rejected
-          // still carries the model's `stop`.
-          sess.setMessages(turnSessionMessages(partial.messages));
-          throw new CommittedTurnError(e);
-        } else {
-          // Without a partial the call never reached the model (a render or
-          // validation failure), and the turn rolls back instead.
-          throw e;
-        }
+      for await (const chunk of result.stream) {
+        sendChunk({ modelChunk: chunk });
+      }
+      const res = await result.response;
+      // An interrupt is a turn outcome, not a failure, even when it arrives
+      // with an error: `generate` reports a restarted tool that interrupted
+      // again with a FAILED_PRECONDITION, because its caller asked for a
+      // completed generation; the agent's caller did not. The tip that comes
+      // back is the same answerable interrupt a first-run interrupt leaves,
+      // and only `resume` can answer either, so the turn takes the success
+      // path and commits the same way both times.
+      if (res.error && res.finishReason !== 'interrupted') {
+        // The response's history ends at a turn seam (see `generate`), so it
+        // is a conversation the caller can continue. Fold it into the session
+        // and commit the turn as a resume point: a CommittedTurnError is what
+        // says so (see SessionRunner.run). The runner reads a failure from
+        // the error it is handed, so the response is handed over as one. The
+        // turn records `failed`, not the response's own finish reason: a
+        // response the loop completed and post-processing then rejected
+        // still carries the model's `stop`.
+        sess.setMessages(turnSessionMessages(res.messages));
+        throw new CommittedTurnError(generationError(res));
       }
 
       if (res.request?.messages) {
