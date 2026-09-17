@@ -31,7 +31,7 @@ import {
   defineCustomAgent,
   definePromptAgent,
 } from '../src/agent.js';
-import { generate } from '../src/generate.js';
+import { GenerationResponseError, generate } from '../src/generate.js';
 import { definePrompt } from '../src/prompt.js';
 import { InMemorySessionStore } from '../src/session-stores.js';
 import {
@@ -374,11 +374,21 @@ describe('Agent', () => {
         { name: 'stripAgent', store },
         async (sess) => {
           await sess.run(async () => {
-            await generate(registry, {
+            const res = await generate(registry, {
               model: 'programmableModel',
               prompt: 'secret prompt',
               tools: ['badTool'],
+              throwOnError: false,
             });
+            // Report the failure with its response, the way a prompt-backed
+            // agent hands the runner what the loop built.
+            if (res.error) {
+              throw new GenerationResponseError(
+                res,
+                res.error.message,
+                res.error.status as any
+              );
+            }
           });
           return {};
         }
@@ -401,7 +411,7 @@ describe('Agent', () => {
       assert.strictEqual(wire.includes('secret prompt'), false);
       assert.strictEqual(wire.includes('"response"'), false);
       const snapshotId = chunks.find((c) => c.turnEnd)?.turnEnd?.snapshotId;
-      assert.ok(snapshotId);
+      assert.ok(snapshotId, 'the failed turn reports its snapshotId');
       const snapshot = await store.getSnapshot({ snapshotId: snapshotId! });
       assert.strictEqual(
         JSON.stringify(snapshot?.error).includes('secret prompt'),

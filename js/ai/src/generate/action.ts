@@ -71,6 +71,7 @@ import {
 import { resolveTools, toToolDefinition, type ToolAction } from '../tool.js';
 import { GenerateMiddlewareDef, resolveMiddleware } from './middleware.js';
 import {
+  ToolFailureError,
   assertValidToolNames,
   errorDetailsOf,
   resolveResumeOption,
@@ -441,9 +442,11 @@ async function generateActionTurn(
   await assertValidToolNames(tools);
 
   // The request has resolved. Every failure from here on throws a
-  // GenerationResponseError carrying a partial response, so the caller gets
-  // the conversation the loop completed alongside the error (see `generate`).
-  // Errors above this line (an unknown model, tool, or resource) carry none.
+  // GenerationResponseError carrying a partial response, which `generate`
+  // hands back as the response when the caller asked for failures on the
+  // response, and otherwise unwraps to the error the failure would have
+  // thrown on its own (see `errorToThrow`). Errors above this line (an
+  // unknown model, tool, or resource) carry none.
   const request = await actionToGenerateRequest(
     rawRequest,
     tools,
@@ -502,13 +505,15 @@ async function generateActionTurn(
         parser,
       }
     );
-    throw new GenerationResponseError(
-      response,
-      message,
-      'FAILED_PRECONDITION',
-      {
+    throw withThrownForm(
+      new GenerationResponseError(response, message, 'FAILED_PRECONDITION', {
         message: interruptedResponse.message,
-      }
+      }),
+      new GenkitError({
+        status: 'FAILED_PRECONDITION',
+        message,
+        detail: { message: interruptedResponse.message },
+      })
     );
   }
   if (revisedRequest && revisedRequest !== rawRequest) {
@@ -671,16 +676,21 @@ async function generateActionTurn(
     // answered is one no provider accepts back. The turn's accounting stays.
     const message = `Exceeded maximum tool call iterations (${maxIterations})`;
     const cause = new GenkitError({ status: 'ABORTED', message });
-    throw new GenerationAbortedError(
-      failurePartial(request, cause, {
-        finishReason: 'aborted',
-        base: response.toJSON(),
-        parser,
-      }),
-      message,
-      'ABORTED',
-      undefined,
-      { cause }
+    throw withThrownForm(
+      new GenerationAbortedError(
+        failurePartial(request, cause, {
+          finishReason: 'aborted',
+          base: response.toJSON(),
+          parser,
+        }),
+        message,
+        'ABORTED',
+        undefined,
+        { cause }
+      ),
+      // What a caller catches: the error the limit has always thrown, with
+      // the refused round's own response.
+      new GenerationResponseError(response, message, 'ABORTED', { request })
     );
   }
 
@@ -761,6 +771,39 @@ async function generateActionTurn(
 export function partialResponseOf(e: unknown): GenerateResponse | undefined {
   const response = (e as any)?.detail?.response;
   return response instanceof GenerateResponse ? response : undefined;
+}
+
+/**
+ * The error a caller catches for each error the loop builds. The loop wraps
+ * every failure once the request has resolved (see `failureError`), so the
+ * partial response travels with it; a caller that did not ask for failures
+ * on the response still gets the error the failure threw on its own, as it
+ * always has: a tool's own error, the model's, the validation error, the
+ * hook's. An error the loop throws in its own name (a blocked response, a
+ * response without a message) is thrown as is.
+ */
+const thrownForms = new WeakMap<object, unknown>();
+
+function withThrownForm<E extends object>(error: E, thrown: unknown): E {
+  thrownForms.set(error, thrown);
+  return error;
+}
+
+/** What `generate` throws for `e`; see `thrownForms`. */
+export function errorToThrow(e: unknown): unknown {
+  if (typeof e === 'object' && e !== null && thrownForms.has(e)) {
+    return thrownForms.get(e);
+  }
+  return e;
+}
+
+/**
+ * The error a failure throws on its own: the cause, except that a tool
+ * failure's cause is the loop's classification of the tool's error, and the
+ * tool's own error is what the caller was catching.
+ */
+function ownError(cause: unknown): unknown {
+  return cause instanceof ToolFailureError ? cause.cause : cause;
 }
 
 /**
@@ -915,12 +958,15 @@ function failureError(
     finishReason: aborted ? 'aborted' : 'failed',
   });
   const Ctor = aborted ? GenerationAbortedError : GenerationResponseError;
-  return new Ctor(
-    partial,
-    partial.error!.message,
-    partial.error!.status as StatusName,
-    undefined,
-    { cause, publicMessage: publicMessageOf(cause, aborted) }
+  return withThrownForm(
+    new Ctor(
+      partial,
+      partial.error!.message,
+      partial.error!.status as StatusName,
+      undefined,
+      { cause, publicMessage: publicMessageOf(cause, aborted) }
+    ),
+    ownError(cause)
   );
 }
 
@@ -935,24 +981,28 @@ function invalidOutputError(
   cause: unknown
 ): GenerationResponseError {
   response.error = runtimeErrorOf(cause);
-  return new GenerationResponseError(
-    response,
-    response.error.message,
-    response.error.status as StatusName,
-    undefined,
-    { cause, publicMessage: publicMessageOf(cause, false) }
+  return withThrownForm(
+    new GenerationResponseError(
+      response,
+      response.error.message,
+      response.error.status as StatusName,
+      undefined,
+      { cause, publicMessage: publicMessageOf(cause, false) }
+    ),
+    cause
   );
 }
 
 /**
  * Rewraps an error that left the turn without its partial response. A
  * `generate` hook that caught the loop's error and threw its own drops the
- * conversation the loop completed; the frame's record restores it verbatim,
- * the way the Go loop restores `lastPartial`, so the partial still reports
- * the loop's own failure while the error carries the hook's. An error raised
- * outside a turn that did reach the model boundary gets a partial synthesized
- * from that turn's request. An error from before the request resolved is
- * returned as is.
+ * conversation the loop completed; the frame's record restores it, the way
+ * the Go loop restores `lastPartial`, and the partial now reports the hook's
+ * error, since that is the failure the caller is handed either way. The
+ * partial keeps how the loop stopped (`failed` or `aborted`). An error
+ * raised outside a turn that did reach the model boundary gets a partial
+ * synthesized from that turn's request. An error from before the request
+ * resolved is returned as is.
  */
 function restorePartial(
   cause: unknown,
@@ -960,14 +1010,20 @@ function restorePartial(
   abortSignal?: AbortSignal
 ): unknown {
   if (turnState.partial) {
-    const aborted = turnState.partial.finishReason === 'aborted';
+    const partial = turnState.partial;
+    const aborted = partial.finishReason === 'aborted';
+    partial.error = runtimeErrorOf(cause, abortSignal);
+    partial.finishMessage = partial.error.message;
     const Ctor = aborted ? GenerationAbortedError : GenerationResponseError;
-    return new Ctor(
-      turnState.partial,
-      messageOf(cause),
-      statusOf(cause, abortSignal),
-      undefined,
-      { cause, publicMessage: publicMessageOf(cause, aborted) }
+    return withThrownForm(
+      new Ctor(
+        partial,
+        partial.error.message,
+        partial.error.status as StatusName,
+        undefined,
+        { cause, publicMessage: publicMessageOf(cause, aborted) }
+      ),
+      cause
     );
   }
   if (turnState.request) {

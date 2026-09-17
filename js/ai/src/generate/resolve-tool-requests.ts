@@ -108,7 +108,7 @@ function toolFailureError(
   const verb = stopped ? 'stopped' : 'failed';
   const isGenkit = cause instanceof GenkitError;
   const text = isGenkit ? cause.originalMessage : getErrorMessage(cause);
-  return new GenkitError({
+  return new ToolFailureError({
     status: stopped ? 'CANCELLED' : 'INTERNAL',
     message: `tool "${name}" ${verb}: ${text}`,
     detail: errorDetailsOf(cause),
@@ -118,6 +118,15 @@ function toolFailureError(
       : `tool "${name}" ${verb}`,
   });
 }
+
+/**
+ * A tool's failure as the loop classifies it (see `toolFailureError`). The
+ * tool's own error is the `cause`, which is what `generate` throws for it by
+ * default: the classification is for the partial response and the wire, not
+ * for a caller that was catching the tool's error before the loop classified
+ * it.
+ */
+export class ToolFailureError extends GenkitError {}
 
 /**
  * The structured details a cause contributes to the error that wraps it: a
