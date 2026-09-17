@@ -16,6 +16,7 @@
 
 import {
   GenkitError,
+  StatusNameSchema,
   deepEqual,
   defineAction,
   defineBidiAction,
@@ -291,7 +292,10 @@ function generationError(res: GenerateResponse): GenerationResponseError {
     res.finishReason === 'aborted'
       ? GenerationAbortedError
       : GenerationResponseError;
-  return new Ctor(res, message, status as GenkitError['status']);
+  // The loop's statuses are canonical; a status a model wrote itself may not
+  // be, and an error is still owed for it.
+  const known = StatusNameSchema.safeParse(status);
+  return new Ctor(res, message, known.success ? known.data : 'INTERNAL');
 }
 
 /**
@@ -1912,24 +1916,35 @@ export function definePromptAgent<
         sendChunk({ modelChunk: chunk });
       }
       const res = await result.response;
-      // An interrupt is a turn outcome, not a failure, even when it arrives
-      // with an error: `generate` reports a restarted tool that interrupted
-      // again with a FAILED_PRECONDITION, because its caller asked for a
-      // completed generation; the agent's caller did not. The tip that comes
-      // back is the same answerable interrupt a first-run interrupt leaves,
-      // and only `resume` can answer either, so the turn takes the success
-      // path and commits the same way both times.
-      if (res.error && res.finishReason !== 'interrupted') {
-        // The response's history ends at a turn seam (see `generate`), so it
-        // is a conversation the caller can continue. Fold it into the session
-        // and commit the turn as a resume point: a CommittedTurnError is what
-        // says so (see SessionRunner.run). The runner reads a failure from
-        // the error it is handed, so the response is handed over as one. The
-        // turn records `failed`, not the response's own finish reason: a
-        // response the loop completed and post-processing then rejected
-        // still carries the model's `stop`.
-        sess.setMessages(turnSessionMessages(res.messages));
-        throw new CommittedTurnError(generationError(res));
+      // A failure the loop reported is one the response cannot pass for a
+      // valid one: something broke, the caller stopped the loop, the model
+      // blocked the response or returned none, or the output it completed
+      // does not match the schema. An `error` a model wrote onto a response
+      // that is otherwise valid is not one of those, and the turn keeps the
+      // reply. Nor is an interrupt: `generate` reports a restarted tool that
+      // interrupted again with a FAILED_PRECONDITION, because its caller
+      // asked for a completed generation; the agent's caller did not. The
+      // tip that comes back is the same answerable interrupt a first-run
+      // interrupt leaves, and only `resume` can answer either, so the turn
+      // takes the success path and commits the same way both times.
+      if (res.error && res.finishReason !== 'interrupted' && !res.isValid()) {
+        // The turn commits the conversation the failing step began from,
+        // which ends at a turn seam (see `generate`) and is what the next
+        // attempt sends again. A response the model completed and the loop
+        // rejected (blocked, without a message, output off the schema) keeps
+        // that message for the caller to see, but not as a message to
+        // continue from: the seam is the request's messages. The turn is
+        // committed as a resume point: a CommittedTurnError is what says so
+        // (see SessionRunner.run). The runner reads a failure from the error
+        // it is handed, so the response is handed over as one, built before
+        // the session changes. The turn records `failed`, not the response's
+        // own finish reason: a rejected completion still carries the model's
+        // `stop`.
+        const failure = generationError(res);
+        sess.setMessages(
+          turnSessionMessages(res.request?.messages ?? res.messages)
+        );
+        throw new CommittedTurnError(failure);
       }
 
       if (res.request?.messages) {

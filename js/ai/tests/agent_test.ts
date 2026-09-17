@@ -4469,6 +4469,128 @@ Now respond to the latest message.`,
         ['user', 'model', 'tool', 'model']
       );
     });
+
+    it('commits the seam, not the rejected message, when structured output fails validation', async () => {
+      const registry = new Registry();
+      registry.apiStability = 'beta';
+      const pm = defineProgrammableModel(registry);
+      let modelCalls = 0;
+      pm.handleResponse = async () => {
+        modelCalls++;
+        return {
+          message: {
+            role: 'model',
+            content: [{ text: modelCalls === 1 ? '{"a": "bad"}' : '{"a": 2}' }],
+          },
+          finishReason: 'stop',
+        };
+      };
+      const store = new InMemorySessionStore();
+      const flow = defineAgent(registry, {
+        name: 'schemaAgent',
+        model: 'programmableModel',
+        output: { schema: z.object({ a: z.number() }) },
+        store,
+      });
+
+      const first = flow.streamBidi({});
+      first.send({ message: { role: 'user', content: [{ text: 'hi' }] } });
+      first.close();
+      for await (const _ of first.stream) {
+      }
+      const failed = await first.output;
+
+      assert.strictEqual(failed.finishReason, 'failed');
+      assert.strictEqual(failed.error?.status, 'INVALID_ARGUMENT');
+      assert.ok(failed.snapshotId, 'the failed turn commits a snapshot');
+      // The rejected completion is not a message to continue from.
+      const row = await store.getSnapshot({ snapshotId: failed.snapshotId! });
+      assert.deepStrictEqual(
+        row?.state?.messages.map((m) => m.role),
+        ['user']
+      );
+
+      // The re-attempt asks the model again from the seam.
+      const again = flow.streamBidi({ snapshotId: failed.snapshotId });
+      again.send({});
+      again.close();
+      for await (const _ of again.stream) {
+      }
+      const output = await again.output;
+      assert.strictEqual(output.error, undefined, JSON.stringify(output.error));
+      assert.deepStrictEqual(output.message?.content[0].text, '{"a": 2}');
+      const finalRow = await store.getSnapshot({
+        snapshotId: output.snapshotId!,
+      });
+      assert.deepStrictEqual(
+        finalRow?.state?.messages.map((m) => m.role),
+        ['user', 'model']
+      );
+      assert.strictEqual(modelCalls, 2);
+    });
+
+    it('commits the seam when the model blocks the response', async () => {
+      const registry = new Registry();
+      registry.apiStability = 'beta';
+      const pm = defineProgrammableModel(registry);
+      pm.handleResponse = async () => ({
+        finishReason: 'blocked',
+        finishMessage: 'safety',
+      });
+      const store = new InMemorySessionStore();
+      const flow = defineAgent(registry, {
+        name: 'blockedAgent',
+        model: 'programmableModel',
+        store,
+      });
+
+      const session = flow.streamBidi({});
+      session.send({ message: { role: 'user', content: [{ text: 'hi' }] } });
+      session.close();
+      for await (const _ of session.stream) {
+      }
+      const output = await session.output;
+
+      assert.strictEqual(output.finishReason, 'failed');
+      assert.strictEqual(output.error?.status, 'FAILED_PRECONDITION');
+      const row = await store.getSnapshot({ snapshotId: output.snapshotId! });
+      assert.strictEqual(row?.status, 'failed');
+      assert.deepStrictEqual(
+        row?.state?.messages.map((m) => m.role),
+        ['user']
+      );
+    });
+
+    it('keeps a valid reply that carries an error a model wrote itself', async () => {
+      const registry = new Registry();
+      registry.apiStability = 'beta';
+      const pm = defineProgrammableModel(registry);
+      pm.handleResponse = async () => ({
+        message: { role: 'model', content: [{ text: 'ok' }] },
+        finishReason: 'stop',
+        error: { status: 'RATE_LIMITED', message: 'slow down' },
+      });
+      const store = new InMemorySessionStore();
+      const flow = defineAgent(registry, {
+        name: 'selfErrorAgent',
+        model: 'programmableModel',
+        store,
+      });
+
+      const session = flow.streamBidi({});
+      session.send({ message: { role: 'user', content: [{ text: 'hi' }] } });
+      session.close();
+      for await (const _ of session.stream) {
+      }
+      const output = await session.output;
+
+      // The loop did not reject the response, so the turn is not a failure.
+      assert.strictEqual(output.finishReason, 'stop');
+      assert.strictEqual(output.error, undefined);
+      assert.strictEqual(output.message?.content[0].text, 'ok');
+      const row = await store.getSnapshot({ snapshotId: output.snapshotId! });
+      assert.strictEqual(row?.status, 'completed');
+    });
   });
 
   // -------------------------------------------------------------------------
