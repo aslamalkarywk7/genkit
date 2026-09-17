@@ -330,12 +330,13 @@ function generationError(res: GenerateResponse): GenerationResponseError {
  * calls the `abort` companion action, which aborts the signal on the status
  * flip.
  *
- * Or the run reached a limit the caller set. The generate loop reports its
- * `maxTurns` as a {@link GenerationAbortedError}, the class it also uses for
- * the signal and for a cancellation or timeout error (`AbortError`,
- * `TimeoutError`) it observed. A turn that propagates such an error unchanged
- * is stopped, not broken, and reports so without having to say it in a
- * {@link TurnResult}.
+ * Or the run reached a limit the caller set. The generate loop throws a
+ * {@link GenerationAbortedError} at `maxTurns`, and reports every stop it
+ * classified on a response it returned as one; a cancellation or timeout it
+ * observed reaches a turn that let the loop throw as the `AbortError` or
+ * `TimeoutError` itself. A turn that lets any of these through, whatever
+ * raised it, is stopped, not broken, and reports so without having to say it
+ * in a {@link TurnResult}, as a Go turn propagating a context error does.
  *
  * Both roads are read from the signal and the error's identity, never from a
  * classified status, which is a wider set than the caller's own doing: a
@@ -577,6 +578,12 @@ export class SessionRunner<State = unknown> {
   public detachRequested: boolean = false;
   /** The requested detach's pending-row write; see {@link detach}. */
   private detachInFlight?: Promise<string>;
+  /**
+   * Set once the run has settled and its output is decided. A detach that
+   * arrives after that has no run to move to the background: {@link detach}
+   * refuses it rather than write a pending row nothing would finalize.
+   */
+  public runEnded: boolean = false;
   /**
    * The pending row as written, kept so the finalize can rebuild it (its
    * lineage and timestamps) even when the store no longer returns it.
@@ -875,7 +882,17 @@ export class SessionRunner<State = unknown> {
       ? 'aborted'
       : (committed && e.result?.finishReason) || 'failed';
     this.lastTurnFinishReason = finishReason;
-    this.lastTurnError = toErrorDetails(cause, finishReason === 'aborted');
+    // A turn that rethrew a signal's reason that is not an error (a string,
+    // nothing at all) is recorded through the signal, as a stop between
+    // turns is.
+    const stopped = finishReason === 'aborted';
+    const reported =
+      stopped &&
+      (cause === null || typeof cause !== 'object') &&
+      this.abortSignal
+        ? stopCause(this.abortSignal)
+        : cause;
+    this.lastTurnError = toErrorDetails(reported, stopped);
     this.lastTurnCommitted = committed;
 
     let snapshotId: string | undefined;
@@ -1026,6 +1043,12 @@ export class SessionRunner<State = unknown> {
       });
     }
     if (this.detachInFlight) return this.detachInFlight;
+    if (this.runEnded) {
+      throw new GenkitError({
+        status: 'FAILED_PRECONDITION',
+        message: 'The run has ended; there is nothing left to detach.',
+      });
+    }
     this.detachRequested = true;
     this.detachInFlight = this.withSnapLock(async () => {
       const snapshotId = this.newSnapshotId || reserveSnapshotId();
@@ -1461,6 +1484,10 @@ function pipeInputWithDetach<State>(
   (async () => {
     try {
       for await (const input of inputStream) {
+        // Once the run has settled nothing reads the queue any more, and a
+        // detach has no run to move to the background: later inputs are
+        // dropped rather than queued or written up as pending.
+        if (getRunner()?.runEnded) continue;
         if (input.detach) {
           if (!storeEnabled) {
             rejectDetach(
@@ -1821,8 +1848,9 @@ export function defineCustomAgent<State = unknown>(
           fnError = e;
           fnThrew = true;
         } finally {
-          // The run has settled, so stop refreshing the pending row's
-          // heartbeat before the finalize clears it.
+          // The run has settled: a detach from here on is refused, and the
+          // pending row's heartbeat stops before the finalize clears it.
+          runner.runEnded = true;
           stopHeartbeat();
           arg.abortSignal.removeEventListener('abort', onCallerAbort);
           if (unsubscribe) unsubscribe();

@@ -4761,6 +4761,71 @@ Now respond to the latest message.`,
       );
     });
 
+    it('refuses a detach that arrives after the run ended', async () => {
+      const store = new InMemorySessionStore<{ count: number }>();
+      const { flow, blocking } = blockingAgent(store);
+
+      const ac = new AbortController();
+      const session = flow.streamBidi({}, { abortSignal: ac.signal });
+      session.send({
+        message: { role: 'user' as const, content: [{ text: 'one' }] },
+      });
+      session.send({
+        message: { role: 'user' as const, content: [{ text: 'block' }] },
+      });
+      void blocking.then(() => ac.abort());
+      const output = await session.output;
+      assert.strictEqual(output.finishReason, 'aborted');
+
+      // The client detaches after the fact. There is no run to move to the
+      // background, so no pending row is written: the session's latest row
+      // stays the committed turn.
+      session.send({ detach: true });
+      session.close();
+      await new Promise((r) => setTimeout(r, 20));
+      const latest = await store.getSnapshot({ sessionId: output.sessionId! });
+      assert.strictEqual(latest?.snapshotId, output.snapshotId);
+      assert.strictEqual(latest?.status, 'completed');
+    });
+
+    it('records a stop reason a turn rethrew as is', async () => {
+      const store = new InMemorySessionStore<{}>();
+      let enterBlock: () => void = () => {};
+      const blocking = new Promise<void>((resolve) => {
+        enterBlock = resolve;
+      });
+      const flow = defineCustomAgent<{}>(
+        new Registry(),
+        { name: 'rethrowReason', store },
+        async (sess, { abortSignal }) => {
+          await sess.run(async () => {
+            enterBlock();
+            await new Promise<never>((_, reject) => {
+              abortSignal?.addEventListener(
+                'abort',
+                () => reject(abortSignal.reason),
+                { once: true }
+              );
+            });
+          });
+          return { message: { role: 'model', content: [{ text: 'done' }] } };
+        }
+      );
+
+      const ac = new AbortController();
+      const session = flow.streamBidi({}, { abortSignal: ac.signal });
+      session.send({
+        message: { role: 'user' as const, content: [{ text: 'go' }] },
+      });
+      session.close();
+      void blocking.then(() => ac.abort('closed by user'));
+      const output = await session.output;
+
+      assert.strictEqual(output.finishReason, 'aborted');
+      assert.strictEqual(output.error?.status, 'CANCELLED');
+      assert.strictEqual(output.error?.message, 'closed by user');
+    });
+
     /**
      * A prompt agent over a model that calls `slow`, a tool whose first call
      * waits to be released and then fails; the model answers "done" once the
