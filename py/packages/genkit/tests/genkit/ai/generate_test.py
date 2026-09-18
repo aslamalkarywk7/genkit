@@ -4498,6 +4498,201 @@ async def test_abort_during_first_tool_drops_unfinished_round() -> None:
 
 
 @pytest.mark.asyncio
+async def test_already_cancelled_generate_returns_prompt() -> None:
+    """A generate cancelled before it starts returns the prompt and does not call the model."""
+    ai = Genkit(model='programmableModel')
+    pm, _ = define_programmable_model(ai)
+    abort_signal = asyncio.Event()
+    abort_signal.set()
+
+    response = await generate_action(
+        ai.registry,
+        GenerateActionOptions(
+            model='programmableModel',
+            messages=[Message(role=Role.USER, content=[Part(TextPart(text='keep going'))])],
+        ),
+        abort_signal=abort_signal,
+    )
+    assert response.finish_reason == FinishReason.ABORTED
+    assert response.finish_message == 'Generation aborted.'
+    assert response.error is not None
+    assert response.error.status == 'CANCELLED'
+    assert response.error.reason is None
+    assert response.error.details is None
+    assert response.error.message == response.finish_message
+    assert response.message is None
+    assert [m.role for m in response.messages] == [Role.USER]
+    assert response.messages[0].text == 'keep going'
+    assert pm.request_count == 0
+
+    pm.responses.append(
+        ModelResponse(
+            finish_reason=FinishReason.STOP,
+            message=Message(role=Role.MODEL, content=[Part(TextPart(text='ok'))]),
+        )
+    )
+    continued = await ai.generate(messages=response.messages)
+    assert continued.finish_reason == FinishReason.STOP
+    assert continued.error is None
+    assert continued.message is not None
+    assert continued.messages[-1] == continued.message
+    assert [m.role for m in continued.messages] == [Role.USER, Role.MODEL]
+    assert continued.messages[0].text == 'keep going'
+    assert continued.messages[-1].text == 'ok'
+
+
+@pytest.mark.asyncio
+async def test_already_cancelled_generate_returns_prior_messages() -> None:
+    """A generate cancelled before it starts returns the messages they passed in."""
+    ai = Genkit(model='programmableModel')
+    pm, _ = define_programmable_model(ai)
+    abort_signal = asyncio.Event()
+    abort_signal.set()
+
+    response = await generate_action(
+        ai.registry,
+        GenerateActionOptions(
+            model='programmableModel',
+            messages=[
+                Message(role=Role.USER, content=[Part(TextPart(text='first'))]),
+                Message(role=Role.MODEL, content=[Part(TextPart(text='ok'))]),
+                Message(role=Role.USER, content=[Part(TextPart(text='again'))]),
+            ],
+        ),
+        abort_signal=abort_signal,
+    )
+    assert response.finish_reason == FinishReason.ABORTED
+    assert response.finish_message == 'Generation aborted.'
+    assert response.error is not None
+    assert response.error.status == 'CANCELLED'
+    assert response.error.reason is None
+    assert response.error.details is None
+    assert response.error.message == response.finish_message
+    assert response.message is None
+    assert [m.role for m in response.messages] == [Role.USER, Role.MODEL, Role.USER]
+    assert response.messages[0].text == 'first'
+    assert response.messages[1].text == 'ok'
+    assert response.messages[2].text == 'again'
+    assert pm.request_count == 0
+
+
+@pytest.mark.asyncio
+async def test_already_cancelled_unknown_model_returns() -> None:
+    """Cancelled generate returns even when the model name would not resolve."""
+    ai = Genkit()
+    abort_signal = asyncio.Event()
+    abort_signal.set()
+
+    response = await generate_action(
+        ai.registry,
+        GenerateActionOptions(
+            model='nope/ghost',
+            messages=[Message(role=Role.USER, content=[Part(TextPart(text='keep going'))])],
+        ),
+        abort_signal=abort_signal,
+    )
+    assert response.finish_reason == FinishReason.ABORTED
+    assert response.finish_message == 'Generation aborted.'
+    assert response.error is not None
+    assert response.error.status == 'CANCELLED'
+    assert response.error.reason is None
+    assert response.error.details is None
+    assert response.error.message == response.finish_message
+    assert response.message is None
+    assert [m.role for m in response.messages] == [Role.USER]
+    assert response.messages[0].text == 'keep going'
+
+
+@pytest.mark.asyncio
+async def test_abort_during_first_model_call_returns_prompt() -> None:
+    """Abort while the first model call is running: only the user message stays."""
+    ai = Genkit(model='hangingModel')
+    abort_signal = asyncio.Event()
+    started = asyncio.Event()
+
+    async def hang(_request: ModelRequest, _ctx: ActionRunContext) -> ModelResponse:
+        started.set()
+        await abort_signal.wait()
+        raise GenkitError(status='ABORTED', message='Generation aborted.')
+
+    ai.define_model(name='hangingModel', fn=hang)
+
+    async def run() -> ModelResponse:
+        return await generate_action(
+            ai.registry,
+            GenerateActionOptions(
+                model='hangingModel',
+                messages=[Message(role=Role.USER, content=[Part(TextPart(text='keep going'))])],
+            ),
+            abort_signal=abort_signal,
+        )
+
+    task = asyncio.create_task(run())
+    await started.wait()
+    abort_signal.set()
+    response = await asyncio.wait_for(task, timeout=2.0)
+    assert response.finish_reason == FinishReason.ABORTED
+    assert response.finish_message == 'Generation aborted.'
+    assert response.error is not None
+    assert response.error.status == 'CANCELLED'
+    assert response.error.reason is None
+    assert response.error.message == response.finish_message
+    assert response.message is None
+    assert [m.role for m in response.messages] == [Role.USER]
+    assert response.messages[0].text == 'keep going'
+
+
+@pytest.mark.asyncio
+async def test_abort_during_later_model_call_keeps_closed_round() -> None:
+    """Abort while a later model call is running: the closed tool round stays."""
+    ai = Genkit(model='hangAfterToolModel')
+    abort_signal = asyncio.Event()
+    second_started = asyncio.Event()
+    model_calls = 0
+
+    @ai.tool(name='lookup')
+    async def lookup() -> str:
+        return '72F'
+
+    async def hang_after_tool(_request: ModelRequest, _ctx: ActionRunContext) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 1:
+            return _model_calls_tool(name='lookup', ref='r1')
+        second_started.set()
+        await abort_signal.wait()
+        raise GenkitError(status='ABORTED', message='Generation aborted.')
+
+    ai.define_model(name='hangAfterToolModel', fn=hang_after_tool)
+
+    async def run() -> ModelResponse:
+        return await generate_action(
+            ai.registry,
+            GenerateActionOptions(
+                model='hangAfterToolModel',
+                messages=[Message(role=Role.USER, content=[Part(TextPart(text='keep going'))])],
+                tools=['lookup'],
+            ),
+            abort_signal=abort_signal,
+        )
+
+    task = asyncio.create_task(run())
+    await second_started.wait()
+    abort_signal.set()
+    response = await asyncio.wait_for(task, timeout=2.0)
+    assert response.finish_reason == FinishReason.ABORTED
+    assert response.finish_message == 'Generation aborted.'
+    assert response.error is not None
+    assert response.error.status == 'CANCELLED'
+    assert response.error.reason is None
+    assert response.error.message == response.finish_message
+    assert response.message is None
+    assert [m.role for m in response.messages] == [Role.USER, Role.MODEL, Role.TOOL]
+    assert response.messages[1].tool_requests[0].tool_request.ref == 'r1'
+    assert _tool_output(response.messages[2]) == '72F'
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('status', ['ABORTED', 'NOT_FOUND', 'INVALID_ARGUMENT', 'FAILED_PRECONDITION'])
 async def test_provider_status_failure_keeps_closed_rounds(status: str) -> None:
     """A provider status is failure data after generation starts, not a setup error."""
